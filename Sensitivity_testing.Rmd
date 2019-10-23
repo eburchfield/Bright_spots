@@ -1,0 +1,735 @@
+---
+title: "Sensitivity testing:  Yield bright spots"
+author: "Dr. Emily Burchfield"
+output: html_document
+---
+
+# Set up
+
+```{r message=F, warning=F}
+library(tidyverse)
+library(sp)
+library(spdplyr)
+library(spdep)
+library(INLA)
+
+county <- readRDS("./data/county.RDS")
+null <- readRDS("./data/null.RDS")%>% filter(YEAR < 2017)
+# census <- readRDS("./data/census.RDS")
+# yield <- readRDS("./data/yield.RDS") %>% filter(YEAR %in% unique(census$YEAR)) # built from Survey
+# prism <- readRDS("./data/corn_PRISM.RDS")
+```
+
+***
+# 1. Model preparation
+
+Null model dataset based on `r nrow(null)` observations across `r length(unique(null$YEAR))` years.
+
+## 1.1. Spatial structure
+
+The yield data available is at a county scale and the distribution of yields across space exhibits strong autocorrelation where yields in neighboring counties are more alike than yields in distant counties. This spatial autocorrelation is accounted for using a standard Conditional Autoreggressive dependency model based on adjacency for all counties in the conterminous US. In order to account for additional county-specific factors that contribute to yields a county iid random effect term is also included, yielding a Besag-York-Mollie (BYM) spatial dependency model. A county adjacency matrix is created for each crop under investigation. 
+
+```{r eval=F}
+# rook structure
+library(INLA)
+library(spdep)
+library(spdplyr)
+
+county_sub <- county %>% filter(GEOID %in% unique(null$GEOID)) %>%
+  arrange(GEOID)
+county_sub$ID <- 1:nrow(county_sub@data)
+# relational matrix
+temp <- poly2nb(county_sub, queen=F) # rook
+h_adj <- nb2mat(temp, style="B", zero.policy = T) 
+h_adj <- as(h_adj, "dgTMatrix") # sparse style matrix conversion
+saveRDS(h_adj, "./data/neighborhood.RDS")
+```
+
+The following code visualizes this network:
+
+```{r}
+county_sub <- county %>% filter(GEOID %in% unique(null$GEOID)) %>%
+  arrange(GEOID)
+rook <- poly2nb(county_sub, queen=F) 
+coords <- coordinates(county_sub)
+plot(county_sub)
+plot(rook, coords, add=T, main = "Rook")
+```
+
+
+```{r eval=F}
+# queen structure
+library(INLA)
+library(spdep)
+library(spdplyr)
+
+county_sub <- county %>% filter(GEOID %in% unique(null$GEOID)) %>%
+  arrange(GEOID)
+county_sub$ID <- 1:nrow(county_sub@data)
+# relational matrix
+temp <- poly2nb(county_sub, queen=T) 
+h_adj <- nb2mat(temp, style="B", zero.policy = T) 
+h_adj <- as(h_adj, "dgTMatrix") # sparse style matrix conversion
+saveRDS(h_adj, "./data/neighborhood_queen.RDS")
+```
+
+The following code visualizes this network:
+
+```{r}
+county_sub <- county %>% filter(GEOID %in% unique(null$GEOID)) %>%
+  arrange(GEOID)
+queen <- poly2nb(county_sub, queen=T) 
+coords <- coordinates(county_sub)
+plot(county_sub)
+plot(queen, coords, add=T, main = "Queen")
+```
+
+Let's quickly confirm that spatial autocorrelation is an issue:
+
+```{r}
+# row standardization 
+rsd_wts <- nb2listw(rook, zero.policy = T) # zero.policy allows inclusion of zero-neighbor entities
+
+county_sub <- county %>% filter(GEOID %in% unique(null$GEOID)) %>%
+  arrange(GEOID)
+county_sub <- merge(county_sub, null %>% filter(YEAR == 2012), by = "GEOID")
+# Moran's I
+rsd_moran <- moran.test(county_sub$YIELD, listw = rsd_wts, randomisation = T, na.action = na.omit, zero.policy = T)
+rsd_moran
+```
+Because our p-value is very significant, we can reject the null of randomly distributed data.  We have significant spatial autocorrelation in the yield data, which justifies the inclusion of a `bym` model.
+
+***
+## 1.2. Prepare data
+
+```{r}
+library(tidyverse)
+library(INLA)
+library(spdplyr)
+
+# load adjacency matrix
+hadj <- readRDS("./data/neighborhood.RDS")
+
+# add ID
+county_sub <- county %>% filter(GEOID %in% unique(null$GEOID)) %>%
+  arrange(GEOID) %>% 
+  mutate(STATE = as.factor(STATEFP)) %>%
+  dplyr::select(GEOID, STATE) 
+county_sub$ID <- 1:nrow(county_sub@data)
+
+null <- merge(null, county_sub@data, by = "GEOID", all = T)
+
+# bin to nearest 10 (-2 does 100), resolution at which estimation occurs
+null$TP<-round(null$TP,-1)  
+null$GDD<-round(null$GDD,-1)
+null$SDD<-round(null$SDD,-1)
+
+# set up priors (used in rw1 functions)
+u=sd(null$YIELD,na.rm=TRUE)
+```
+
+***
+## 1.3. Functions
+
+```{r}
+run_model <- function(formula, data, name, save=T) {
+  out <- inla(formula, data=data, family="gaussian", 
+              control.predictor = list(compute=T), 
+              control.compute = list(dic=T, cpo=T))
+  if (save==T) {
+    saveRDS(out, paste0("./out/", name, ".RDS")) 
+  } 
+  return(out)
+}
+
+model_diagnostics <- function(model_run, data) {
+  # add plots and additional checks in model.results()
+  # Gelman R2 in cross.val function
+  
+  if (is.character(model_run)) {
+    r <- readRDS(model_run)
+  } else (r <- model_run)
+  
+  fdf <- cbind(data, r$summary.fitted.values$mean)
+  colnames(fdf)[dim(fdf)[2]] <- c("FittedVals")
+  
+  # Deviance information criterion, useful for cross-model comparison (p. 170)
+  # Models with smaller DIC are better supported by the data
+  DIC <- r$dic$dic
+  
+  # Cross-validation (5.6.1, p. 166)
+  
+  # Conditional predictive ordinate, LOOCV
+  # Compare copetitive models in terms of predictive performance, with larger values denoting better fit
+  CPO <- sum(log(r$cpo$cpo), na.rm=T)
+  # Probability Integral Transform, uniform distribution means the predictive distribution is coherent with the data
+  PIT <- ggplot() +
+    geom_histogram(aes(x = r$cpo$pit)) +
+    ggtitle("PIT")
+ 
+  # Posterior predictive checks (5.6.1, p. 168)
+  
+  # Posterior predictive distribution
+  ppv <- c()
+  for (i in 1:nrow(fdf)) {
+    ppv[i] <- inla.pmarginal(q = fdf$YIELD[i], 
+                             marginal = r$marginals.fitted.values[[i]])
+  }
+  # Linear indicates close fit between observed and predicted
+  PPC_PT <- ggplot(fdf) +
+    geom_point(aes(x = YIELD, y = fdf$FittedVals), alpha=0.2) +
+    xlab("Observed") + ylab("Mean posterior predictive distribution") +
+    theme_classic()
+  # Reasonable fit should have few high P-values
+  PPC_HIST <- ggplot() +
+    geom_histogram(aes(x = ppv)) +
+    ggtitle("Posterior predictive p-values")
+
+  MSE <- 1/(length(fdf$YIELD)*sum((fdf$YIELD - fdf$FittedVals)^2, na.rm=T))
+  pred_res2<-(fdf$FittedVals[!is.na(fdf$YIELD)] - mean(fdf$YIELD, na.rm=T)) ^2
+  obs_res2<-(fdf$YIELD[!is.na(fdf$YIELD)] - mean(fdf$YIELD, na.rm=T))^2
+  R2<-sum(pred_res2, na.rm=T)/sum(obs_res2, na.rm=T)
+  
+  fit <- list(DIC, CPO, MSE, R2, PIT, PPC_PT, PPC_HIST)
+  names(fit) <- c("DIC", "CPO", "MSE", "R2", "PIT", "PPC_PT", "PPC_HIST")
+  return(fit)
+}
+
+spatial_effects <- function(model_run, data, level) {
+  # assumes set-up code has been run loading cty shapefile
+  
+  r <- model_run
+  n <- length(unique(data$GEOID))
+  # extract area-specific residuals
+  asr <- r$summary.random[[level]][1:n, c(1, 2, 3)]  # ID, mean, sd
+  if (level == "STATE") {
+    colnames(asr) <- c("STATE", "mean", "SD")
+  } 
+  map_asr <- sf::st_as_sf(merge(county_sub, asr, by = level))
+  # include indicator of significance (not just mean)
+  
+  require(viridis)
+  
+  se <- ggplot(map_asr) +
+    geom_sf(color = "transparent", size = 0.05, aes(fill = mean)) +
+    theme_minimal() +
+    scale_fill_viridis(option = "magma")
+  
+  return(se)
+  
+}
+
+nonlinear_effect <- function(model_run, variable) {
+  r <- model_run
+  nle <- ggplot(data = r$summary.random[[variable]][,c(1,4:6)], 
+               aes(x = ID, y = `0.5quant`)) +
+    geom_point() +
+    geom_line(aes(x = ID, y = `0.025quant`) , col="#0d98ba") +
+    geom_line(aes(x=ID, y=`0.975quant`), col="#0d98ba") + 
+    theme_minimal() +
+    theme(legend.position="none") +
+    xlab(variable) +
+    ylab("Effect on yield (bu/ac)")
+  return(nle)
+}
+
+generate_DIC <- function(fm, mod_id) {
+  modr <- run_model(fm, data=null, name = mod_id, save=F)
+  modd <- model_diagnostics(modr, null)
+  return(list(modd$DIC, modd$R2))
+}
+
+```
+  
+***
+# 2. Model sensitivity checks
+
+1. Null model with `iid` effects at both levels and default priors.
+2. Add predictors to Model 1.
+3. Add non-linear predictors to model 1.
+4. Add spatial effect at county-level (`bym`).
+5. Informative Gamma priors on the precisions.
+6. Penalized complexity priors (`bym2`).
+
+## 2.1. Null model with `iid` effects 
+
+Null model with `iid` effects at the county and state levels with default priors.  Default priors used here on the random effect precision ($\frac{1}{v_{0}^2}$) of logGamma(1, 0.00005).  On the inverse of the measurement error $\tau = \frac{1}{\sigma^2}$, the default prior is a noninformative logGamma (same thing)
+
+```{r}
+formula <- YIELD ~ 1 + f(ID, model = "iid") + f(STATE, model = "iid")
+o1 <- inla(formula, data=null, family="gaussian",
+           control.predictor = list(compute=T), 
+           control.compute = list(dic=T, cpo=T))
+d <- model_diagnostics(o1, null)
+summary(o1) # high value of Precision for ID
+```
+
+```{r}
+d$DIC 
+d$R2 
+```
+
+```{r}
+d$PIT 
+```
+
+***
+## 2.2. (2.1) + predictors
+
+Here we add the climate and time predictors to the null model.  This improves model fit.
+
+```{r}
+formula <- YIELD ~ 1 + f(ID, model = "iid") + f(STATE, model = "iid") + GDD + TP + SDD + PERC_IRR + factor(YEAR)
+o2 <- inla(formula, data=null, family="gaussian",
+           control.predictor = list(compute=T), 
+           control.compute = list(dic=T, cpo=T))
+d <- model_diagnostics(o2, null)
+summary(o2) # high precision for ID
+# year factor explains a lot of the variance, climate predictors have very small effect.
+```
+
+```{r}
+d$DIC 
+d$R2 
+```
+
+```{r}
+d$PIT 
+```
+
+***
+## 2.3. Non-linear covariates
+
+Now we add nonlinear effects to the climate predictors since this is well-established in the literature.  We start with the recommended values of $u$ and $\alpha$ on the $\theta$ prior.  For Gaussian models, the recommended value of $u$ is the empirical standard deviation of the data and $\alpha$ is 0.01 (as described [here](https://inla.r-inla-download.org/r-inla.org/doc/latent/rw1.pdf)).  Note that increasing $u$ gives a weaker prior while decreasing $u$ gives a stronger prior.  
+
+I also tested fit with a nonlinear irrigation term, but fit was worse, so stuck with a simple linear predictor.
+
+This slightly improves model fit, but our PIT histogram is no longer uniform.
+
+```{r}
+u <- sd(null$YIELD)  # for one year, varies only a tiny bit
+
+formula <- YIELD ~ 1 + f(ID, model = "iid") + 
+  f(STATE, model = "iid") + 
+  f(GDD, model = "rw1", scale.model = T, hyper = list(theta = list(prior = "pc.prec",
+                                                                   param = c(u, 0.01)))) +
+  f(SDD, model = "rw1", scale.model = T, hyper = list(theta = list(prior = "pc.prec",
+                                                                   param = c(u, 0.01)))) +
+  f(TP, model = "rw1", scale.model = T, hyper = list(theta = list(prior = "pc.prec",
+                                                                   param = c(u, 0.01)))) +
+  PERC_IRR +
+  factor(YEAR)
+
+o3 <- inla(formula, data=null, family="gaussian",
+           control.predictor = list(compute=T), 
+           control.compute = list(dic=T, cpo=T))
+d <- model_diagnostics(o3, null)
+summary(o3) # high precision for ID
+```
+
+```{r}
+d$DIC #72271
+d$R2 #.47
+```
+
+
+```{r}
+d$PIT # not uniform
+```
+
+```{r}
+gdd <- nonlinear_effect(o3, "GDD")
+sdd <- nonlinear_effect(o3, "SDD")
+tp <- nonlinear_effect(o3, "TP")
+gdd
+```
+
+```{r}
+sdd
+```
+
+```{r}
+tp
+```
+
+***
+## 2.4 Spatially-structured errors at county-level (`bym`)
+
+Since we know there is significant spatial autocorrelation in the county-level yield data, we include a `bym` model at this scale that includes both county random effects and spatially-structured effects (documentation for `bym` found [here](https://inla.r-inla-download.org/r-inla.org/doc/latent/bym.pdf)).  A few notes:
+
+* `constr = TRUE`, which is interpreted as nc2 sum-to-zero constraints for each of the connected components in the graph; in other words, this sets a sum-to-zero constraint on the term.  Appears to be best practice and widely used in implementations of `bym` and `bym2` models (see [here](https://arxiv.org/pdf/1601.01180.pdf)).
+* In addition, `scale.model = TRUE`, which is widely recommended for facilitating prior specification and for interpretability of results (read more [here](http://inla.r-inla-download.org/r-inla.org/tutorials/inla/scale.model/scale-model-tutorial.pdf) and [here](http://statmath.wu.ac.at/research/talks/resources/slidesrue.pdf)).  The purpose of scaling is to ensure that a fixed hyperparameter for the precsion parameter has a similar interpretation across graph structures.  This basically constrains random effect deviation from the mean to have a similar deviation range.  
+* We include the rook neighborhood constructed in Section 1.1.
+
+This model fits significantly better than 2.3:
+
+```{r}
+u <- sd(null$YIELD)  
+
+formula <- YIELD ~ 1 + f(ID, model = "bym", 
+                         graph = hadj, 
+                         scale.model = TRUE, 
+                         constr = TRUE) + 
+  PERC_IRR +
+  f(STATE, model = "iid") + 
+  f(GDD, model = "rw1", scale.model = T, hyper = list(theta = list(prior = "pc.prec",
+                                                                   param = c(u, 0.01)))) +
+  f(SDD, model = "rw1", scale.model = T, hyper = list(theta = list(prior = "pc.prec",
+                                                                   param = c(u, 0.01)))) +
+  f(TP, model = "rw1", scale.model = T, hyper = list(theta = list(prior = "pc.prec",
+                                                                   param = c(u, 0.01)))) +
+  factor(YEAR)
+
+o4 <- inla(formula, data=null, family="gaussian",
+           control.predictor = list(compute=T), 
+           control.compute = list(dic=T, cpo=T))
+d <- model_diagnostics(o4, null)
+summary(o4) # high precision for ID iid and STATE components
+```
+
+```{r}
+d$DIC # 68757
+d$R2 # .63
+# higher R2, slightly lower DIC
+```
+
+```{r}
+d$PIT # more uniform, suggests slightly better fit
+```
+
+
+***
+## 2.5. Informative Gamma priors on the precisions for the STATE effect
+
+The `prec` (precision) priors are generally logGamma with parameters $\alpha$ and $b$ which define the shape of the gamma distribution.  The default settings for these models are not very imformative.  We can add more informative gamma priors for the precisions in the model.  We could, for example, define the mean value of the gamma prior to the inverse of the variance of the residuals of the fixed-effects only model (read more [here](http://www.maths.bath.ac.uk/~jjf23/inla/multilevel.html#informative-gamma-priors-on-the-precisions) and [here](http://www.maths.bath.ac.uk/~jjf23/inla/nested.html)).  We expect the variances to be lowest than this variance, so this is an overestimate.  The variance of the gamma prior (for the precison) is controlled by the $\alpha$ shape parameter, where smaller values are less informative.  Note that I re-ran the models with a lowest value of $\alpha$ (so less informative priors), this really increased the precision on the spatial parameters (so adding some information helps this) and significantly reduced model fit.  We'll stick with the informative gamma priors on the `STATE` effect based on the variance of the residuals from a simple linear model.  I also tried to decrease the value of $b$ (as if I used residuals from a linear model with fixed effects).  This model still had a high precision for the county-level precision, but that's because we haven't added PC priors yet. Model fit wasn't better than with the higher value of $b$. 
+
+The final model improves model fit as compared to 2.4:
+
+```{r}
+# state log-gamma priors
+a <- 0.5
+lmod <- lm(YIELD ~ factor(YEAR) + GDD + SDD + TP, data = null)
+b <- a*var(residuals(lmod))
+
+# rw1 prior information
+u <- sd(null$YIELD)  
+
+formula <- YIELD ~ 1 + f(ID, model = "bym", 
+                         graph = hadj, 
+                         scale.model = TRUE, 
+                         constr = TRUE) + 
+  PERC_IRR +
+  f(STATE, model = "iid", hyper = list(prec = list(prior = "loggamma", param = c(a, b)))) + 
+  f(GDD, model = "rw1", scale.model = T, hyper = list(theta = list(prior = "pc.prec",
+                                                                   param = c(u, 0.01)))) +
+  f(SDD, model = "rw1", scale.model = T, hyper = list(theta = list(prior = "pc.prec",
+                                                                   param = c(u, 0.01)))) +
+  f(TP, model = "rw1", scale.model = T, hyper = list(theta = list(prior = "pc.prec",
+                                                                   param = c(u, 0.01)))) +
+  factor(YEAR)
+
+o5 <- inla(formula, data=null, family="gaussian",
+           control.predictor = list(compute=T), 
+           control.compute = list(dic=T, cpo=T))
+d <- model_diagnostics(o5, null)
+summary(o5) # high precision for ID iid 
+
+
+```
+
+```{r}
+d$DIC #67994
+d$R2 #0.69
+```
+
+```{r}
+d$PIT # uniform
+```
+
+
+***
+## 2.6. Penalized complexity priors (`bym2`)
+
+Though the previous model fits overall better, the high estimates on the IID precision suggests there's still a problem (see [here](https://groups.google.com/forum/#!topic/r-inla-discussion-group/OCIDIUGUerY)).  To address this, I use the PC prior specification.
+
+This implementation is based on the scripts provided [here](http://inla.r-inla-download.org/r-inla.org/case-studies/pc-prior/bym/bym.R) which are based on the article by Simpson et al found [here](https://arxiv.org/pdf/1403.4630.pdf).  
+
+This approach addresses some common issues with `bym` models.  First, the spatially-structured component is not scaled (`scale.model=T`). This means that the prior depends on the graph structure of the application.  In the `bym2` approach
+
+Though the model fit is slightly worse here than in 2.5, this prior specification address some known issues with `bym`, so I'll stick with it.  It also adresses the high precision parameters in the previous models, see [here](https://groups.google.com/forum/#!topic/r-inla-discussion-group/OCIDIUGUerY).
+
+Note: I tried addint `constr=T` to the `rw1` functions based on [this article](https://link.springer.com/content/pdf/10.1007%2Fs00477-017-1405-0.pdf); this doesn't change anything and is recommended.  I also tested sensitivity to a queen neighborhood structure and this did not significantly change model fit.
+
+```{r}
+# state log-gamma priors
+a <- 0.5
+lmod <- lm(YIELD ~ factor(YEAR) + GDD + SDD + TP + PERC_IRR, data = null)
+b <- a*var(residuals(lmod))
+
+# rw1 prior information
+u <- sd(null$YIELD) 
+
+# bym2 recommended priors
+n <- nrow(null)
+u_bym = 0.2/0.31
+alpha = 0.01
+phi.u = 0.5
+phi.alpha = 2/3 ## prob(phi < phi.u) = phi.alpha
+
+formula <- YIELD ~ 1 + f(ID, model="bym2", # county-level spatial structure
+    graph=hadj,
+    scale.model=TRUE,
+    constr = TRUE,
+    hyper=list(phi =list(prior = "pc", param = c(phi.u, phi.alpha), inital = -3),
+               prec =list(prior = "pc.prec", param = c(u_bym,alpha), inital = 5))) +
+  PERC_IRR +
+  f(STATE, model = "iid", hyper = list(prec = list(prior = "loggamma", param = c(a, b)))) + 
+  f(GDD, model = "rw1", scale.model = T, constr = T, hyper = list(theta = list(prior = "pc.prec",
+                                                                   param = c(u, 0.01)))) +
+  f(SDD, model = "rw1", scale.model = T, constr = T, hyper = list(theta = list(prior = "pc.prec",
+                                                                   param = c(u, 0.01)))) +
+  f(TP, model = "rw1", scale.model = T, constr = T, hyper = list(theta = list(prior = "pc.prec",
+                                                                   param = c(u, 0.01)))) +
+  factor(YEAR)
+
+o6 <- inla(formula, data=null, family="gaussian",
+           control.predictor = list(compute=T), 
+           control.compute = list(dic=T, cpo=T))
+d <- model_diagnostics(o6, null)
+summary(o6) # all precision estimates within a reasonable range now!
+```
+
+```{r}
+d$DIC # 69607
+d$R2 # .59
+```
+
+```{r}
+d$PIT # uniform
+```
+
+
+**References relevant to `bym2`/PC priors:**
+
+* Slide overview, UWash [here](http://faculty.washington.edu/jonno/SISMIDmaterial/3-spatial1.pdf) with access to full repo [here](http://faculty.washington.edu/jonno/SISMIDmaterial/).
+* Riebler et al, 2016, [An Intuitive Bayesian model for disease mapping that accounts for scaling.](https://arxiv.org/pdf/1601.01180.pdf)
+
+
+## 2.7. Penalized complexity (another way)
+
+Added pc prior to BYM effect (estimated now as `bym2`)... Based on section [here]
+(http://www.maths.bath.ac.uk/~jjf23/inla/multiple.html#informative-gamma-priors-on-the-precisions)
+
+```{r}
+apar <- 0.5
+lmod <- lm(YIELD ~ GDD + SDD + TP + PERC_IRR + factor(YEAR), null)
+bpar <- apar*var(residuals(lmod))
+lgprior_iid <- list(prec = list(prior="loggamma", param = c(apar,bpar)))
+
+sdres <- sd(residuals(lmod))
+lgprior_bym <- list(prec = list(prior="pc.prec", param = c(3*sdres, 0.01)))
+
+u <- sd(null$YIELD)
+
+formula <- YIELD ~ 1 + f(ID, model="bym2", # county-level spatial structure
+    graph=hadj,
+    scale.model=TRUE,
+    constr = TRUE,
+    hyper= lgprior_bym) +
+  PERC_IRR +
+  f(STATE, model = "iid", hyper = lgprior_iid) + 
+  f(GDD, model = "rw1", scale.model = T, constr = T, hyper = list(theta = list(prior = "pc.prec",
+                                                                   param = c(u, 0.01)))) +
+  f(SDD, model = "rw1", scale.model = T, constr = T, hyper = list(theta = list(prior = "pc.prec",
+                                                                   param = c(u, 0.01)))) +
+  f(TP, model = "rw1", scale.model = T, constr = T, hyper = list(theta = list(prior = "pc.prec",
+                                                                   param = c(u, 0.01)))) +
+  factor(YEAR)
+
+o7 <- inla(formula, data=null, family="gaussian",
+           control.predictor = list(compute=T), 
+           control.compute = list(dic=T, cpo=T))
+d <- model_diagnostics(o7, null)
+summary(o7) # all precision estimates within a reasonable range now!
+```
+
+```{r}
+d$DIC # 69586
+d$R2 # .64
+```
+
+```{r}
+d$PIT 
+```
+
+
+```{r}
+sdd <- nonlinear_effect(o7, "SDD")
+gdd <- nonlinear_effect(o7, "GDD")
+tp <- nonlinear_effect(o7, "TP")
+sdd
+gdd
+tp
+```
+
+
+***
+## 2.8. Penalized complexity (more informative rw2 priors)
+
+Added pc prior to BYM effect (estimated now as `bym2`)... Based on section [here]
+(http://www.maths.bath.ac.uk/~jjf23/inla/multiple.html#informative-gamma-priors-on-the-precisions)
+
+```{r}
+apar <- 0.5
+lmod <- lm(YIELD ~ GDD + SDD + TP + PERC_IRR + factor(YEAR), null)
+bpar <- apar*var(residuals(lmod))
+lgprior_iid <- list(prec = list(prior="loggamma", param = c(apar,bpar)))
+
+sdres <- sd(residuals(lmod))
+lgprior_bym <- list(prec = list(prior="pc.prec", param = c(3*sdres, 0.01)))
+
+u <- 0.6
+
+formula <- YIELD ~ 1 + f(ID, model="bym2", # county-level spatial structure
+    graph=hadj,
+    scale.model=TRUE,
+    constr = TRUE,
+    hyper= lgprior_bym) +
+  PERC_IRR +
+  f(STATE, model = "iid", hyper = lgprior_iid) + 
+  f(GDD, model = "rw1", scale.model = T, constr = T, hyper = list(theta = list(prior = "pc.prec",
+                                                                   param = c(u, 0.01)))) +
+  f(SDD, model = "rw1", scale.model = T, constr = T, hyper = list(theta = list(prior = "pc.prec",
+                                                                   param = c(u, 0.01)))) +
+  f(TP, model = "rw1", scale.model = T, constr = T, hyper = list(theta = list(prior = "pc.prec",
+                                                                   param = c(u, 0.01)))) +
+  factor(YEAR)
+
+o8 <- inla(formula, data=null, family="gaussian",
+           control.predictor = list(compute=T), 
+           control.compute = list(dic=T, cpo=T))
+d <- model_diagnostics(o8, null)
+summary(o8) # all precision estimates within a reasonable range now!
+```
+
+```{r}
+d$DIC # 69586
+d$R2 # .64
+```
+
+```{r}
+d$PIT 
+```
+
+```{r}
+sdd <- nonlinear_effect(o8, "SDD")
+gdd <- nonlinear_effect(o8, "GDD")
+tp <- nonlinear_effect(o8, "TP")
+sdd
+gdd
+tp
+```
+
+***
+# 3.  Final model description (2.7)
+
+Formalization:
+
+$$ y_{ij} ~ N(\mu_{ij}, \sigma^2) $$
+$$ \mu_{ij} = \beta_{0j} + f(X_{cty}) + \beta_1 Z_{cty} $$
+$$ \beta_{0j} = b_0 + u_i + v_i $$
+
+Where:
+
+* $\sigma^2$ is the precision for the Gaussian observations (`r o6$summary.hyperpar$mean[1]`)
+* $b_0$ is the intercept, or the average yield in the baseline year (2002) (`r o6$summary.fixed[1,1]`).
+* $v_i$ are the area-specific residuals for counties (random effects) which can be accessed as follows: `round(head(modr$summary.random$ID[1:n]), 3)`
+* $u_i$ are the spatially-structured residuals, which can be accessed as follows:  `round(head(modr$summary.random$ID[n:length(modr$summary.random$ID), 2:3]), 3)`
+* $f(X_{cty})$ are the non-parametric county-level covariates described by a `rw1` $f()$
+* $Z_{cty}$ are normal covariates at the county-level.
+
+And $\beta_{0j}$ can be computed as: 
+
+```{r eval=F}
+# code for computing B_{0j}
+n <- length(unique(null$GEOID))
+b0 <- inla.rmarginal(1000, marg = modr$marginals.fixed$`(Intercept)`)
+v0 <- matrix(NA, 1000, n) 
+for (i in 1:n) {
+  v0[,i] <- inla.rmarginal(1000, marg = modr$marginals.random$ID[[i]])
+}
+
+beta0 <- b0+v0
+beta0_quartiles <- as.data.frame(t(apply(beta0, MARGIN=2, function(x) quantile(x, probs = c(0.025, 0.5, 0.975)))))
+beta0_quartiles$ID <- unique(null$GEOID)
+```
+
+Prior information:
+
+* The precision on the county-level random effects is defined using PC priors (see below)
+* The $\phi$ value for the county-level spatial effects is also defined using PC priors.
+* The state-level precision on the iid random effects is defined using informative logGamma priors based on the residual variation from a simple linear model.
+* The precision for the non-parametric smoothing parameter is based on the recommendations on the `rw1` documentation.
+
+The final model is a random-effects panel model that includes the following:
+
+## 3.1. County-level random effects ($v_i$)
+
+County random effects (deviation of the county mean, $v_i$ from the population mean, $b_0$).  These effects account for any time-invariant factors that differ across counties. The precision of these effects is based on the penalized complexity prior specifications specified in [Simpson et al, 2016](https://arxiv.org/pdf/1403.4630.pdf) and listed in [this code.](http://inla.r-inla-download.org/r-inla.org/case-studies/pc-prior/bym/bym.R)
+
+## 3.2. County-level spatial effects ($u_i$)
+
+Intrinsic conditional autoregressive (iCAR) structured residuals at the county-level ($u_i$) were included to account for the fact that nearby things are similar (high spatial autocorrelation in the data).  
+
+This variance structure recognizes the fact that in the presence of strong spatial correlation, the more neighbors an area has the more information there is about the random effect, while the variance parameter (precision for ID, $\gamma_{u}^2$) controls the amount of variation between the spatially structured random effects.  The parameter $\phi$ controls the "properness" of the distribution (p. 178).  `bym` sets $\phi$ to 1, the `bym2` applies some flexibility here.
+
+Spatial structure is modeled using a rook neighborhood using INLA's `bym2` model, a reparameterization of the classic `bym` model in which $u$ and $v$ are standardized to have a variance equal to one.  The marginal precision is $\tau$ and the marginal variance explained by the spatial effect $u_i$ is $\phi$.  Read more about this approach [here](https://inla.r-inla-download.org/r-inla.org/doc/latent/bym2.pdf).  We use default parameters for $\phi$ and penalized complexity prior for 
+
+The precision on these effects is based on the standard error of the residuals from a linear regression, as done [here](http://www.maths.bath.ac.uk/~jjf23/inla/multiple.html#informative-gamma-priors-on-the-precisions) for a penalized complexity prior, so we scale the SDs of the random effects using the SD of the residuals of the fixed effects only model.  Will need to review [this](https://arxiv.org/pdf/1403.4630v3.pdf) for full understanding of this parameterization.
+
+Besag model where each region conditionally has a Gaussian distribution with mean equal to the average of the neighbors adn a precision proportional to the number of neighbors.
+
+Besag along accounts for only similarities between regions, but doesn't account for the fact that every region will have a bit of individual spice, adding an iid random effect in each region (a random intercept) helps - this is BYM.
+
+$$ \eta_i = \mu + u_i + v_i + f(c) $$
+
+Where u is the structured/spatial component, and v is the unstructured component.  $f(c)$ is the non-linear effect of covariate c and the precitions $\tau_u$, $\tau_v$, and a smoothing parameter $\tau_f$ - common to use indpendent gamma priors here.
+
+This is a classic bym model - but the issue is that this is complicated, the split variance, split components, "it would be much easier to have one parameter controlling the scale of the ramdom effect and another controlling its makeup" - this is bym2.  Rewrite the models as:
+
+$$ \eta = \frac{1}{\sqrt{\tau}} ( \sqrt(1 - \gamma)v + \sqrt{\gamma}u) $$
+
+With marginal precisions $\tau$ and $\gamma$ gives it interpretation, insependence with value of zero, maximal dependence with value of 1.  The PC prior on gamma depends on the graph!  The previous has a covariance matrix:
+
+$$ Var(b|\tau_b, \phi) = \tau_{b}^{-1} ((1-\phi)I + \phi Q_{*}^-) $$
+
+Using this new parameterization based on the scaled structured component $u_*$ where $Q_*$ is the precision matrix of the Besag model scaled according to 3.2 ([here](https://arxiv.org/pdf/1601.01180.pdf)).  Now $Var(b|\tau_b, \phi)$ has a clear intretation.  So $0 \leq \phi \leq 1$ measures the proportion of the marginal variance explained by the structured effect.  Pure spatial dispersion with zero, only spatially structured values with 1.  
+
+PC priors allows us to distribute the total variance of the components of the BYM2 model - first, a prior for $\tau_b$ is defined which will contorl the marginal variance contribution of the weighted sum of v and u.  Second, the marginal variance is distributed to the components v and u by defining a suitable parameter for the mixing parameter $phi$.
+
+The second level base model is defined as having only unstructured spatial noise and no spatial dependency ($\phi=0$). By increasing this value, spatial dependency is gradually blended into the model and the model component explaining most of the varianec shifts from v to u.
+
+## 3.3. State-level random effects 
+
+The `iid` state-level random effects are parameterized based on the residual variability from a simple linear model with all covariates in the null model.
+
+## 3.4. Non-linear covariate effects $f(X)$
+
+Non-parametric effects of seasonal temperature and precipitation using a first-order random walk function (`rw1`).  The $\theta$ hyperparameter is parameterized as recommended for Gaussian models, where $u$ is the empirical standard deviation of the data and $\alpha$ is 0.01 (as described [here](https://inla.r-inla-download.org/r-inla.org/doc/latent/rw1.pdf)). 
+
+## 3.5. To develop:
+
+* These models also employ sum-to-zero constraints for all random effects, see [this reference](https://link.springer.com/article/10.1007%2Fs00477-017-1405-0).
+* Student T distribution
+* hyperpar()
+
+More notes to incorporate:
+
+The hierarchical structure assumes an intercept for each state, where $$ B_{0j} = b_0 + v_{0j} $$ with $$ v_{0j} ~ Normal(0, \sigma_{v_0}^2) $$.  On the log precision a noninfomrative logGamme prior is assumed.  The model basicall includes group-specific intercepts (random intercepts model) - there's no real reason to think that the way in whcih climate affects yield of a particular crop varies across space, therefore, random slopes were not assessed.  The idea is that we change our regression model to have group-specific intercepts... So start with $$ y_{ij} ~ N(\mu_{ij}, \sigma^2) $$.  Then break down the mean as follows (for random intercept, other exaplines on 151)... 
+
+$$ \mu_{ij} = \beta_{0j} + \beta_i x_{ij}     , \beta_{0j} = b_0 + v_{0j} $$
+
+Where $b_1$ is a fixed effect, trypically normally distributed with mean of zero and a large variance.  $v_{0j}$ is a random effect, typucally normally distributed with an exchangeable structure, i.e $v_{0j} ~ N(0, \sigma_{v_0}^2)$.  Here we estimate a random intercept model.  This is like saying the regression lines are parallel (effects are the same) but the intercept varies.
+
+The hierarchical model shrinks the balues of $B_{0j}$ toward their mean since they are all generated by a distribution characterized by the same precision.  This means that they are similar wihich has an impact in reducing the uncertainty in the estimates, as they can borrow strength from each other.  Known as global smoothing.  
+

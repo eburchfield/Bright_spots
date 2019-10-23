@@ -1,0 +1,921 @@
+---
+title: "Bright spots"
+author: "Emily Burchfield"
+output: html_document
+---
+
+# To do
+
+* Cross validation, other model fit assessments?  Read through this section and document, CPO/PIT may already be doing LOOCV.
+* Yield normality (it ain't), family=T, robustify errors, 137
+
+## Bright spots analysis {.tabset .tabset-fade}
+
+### 1. Set up
+
+#### 1.1. Load packages and files
+
+Packages and files needed to run analysis. All notes on dataset construction can be found in the `BS_data_construction.html` file.
+
+```{r message=F, warning=F}
+source("BS_func.R")
+source("BS_load.R")
+```
+
+Null model dataset based on `r nrow(null)` observations across `r length(unique(null$YEAR))` years.
+
+#### 1.2. Define spatial structure
+
+The yield data available is at a county scale and the distribution of yields across space exhibits strong autocorrelation where yields in neighboring counties are more alike than yields in distant counties. This spatial autocorrelation is accounted for using a standard Conditional Autoreggressive dependency model based on adjacency for all counties in the conterminous US. In order to account for additional county-specific factors that contribute to yields a county iid random effect term is also included, yielding a Besag-York-Mollie (BYM) spatial dependency model. A county adjacency matrix is created for each crop under investigation. For regional models a seperate county adjacency matrix for each region-crop combination is created.
+
+```{r eval=F}
+# rook structure
+library(INLA)
+library(spdep)
+library(spdplyr)
+
+county_sub <- county %>% filter(GEOID %in% unique(null$GEOID)) %>%
+  arrange(GEOID)
+county_sub$ID <- 1:nrow(county_sub@data)
+# relational matrix
+temp <- poly2nb(county_sub, queen=F) # rook
+h_adj <- nb2mat(temp, style="B", zero.policy = T) 
+h_adj <- as(h_adj, "dgTMatrix") # sparse style matrix conversion
+saveRDS(h_adj, "./data/neighborhood.RDS")
+```
+
+```{r eval=F}
+# queen structure
+library(INLA)
+library(spdep)
+library(spdplyr)
+
+county_sub <- county %>% filter(GEOID %in% unique(null$GEOID)) %>%
+  arrange(GEOID)
+county_sub$ID <- 1:nrow(county_sub@data)
+# relational matrix
+temp <- poly2nb(county_sub, queen=T) 
+h_adj <- nb2mat(temp, style="B", zero.policy = T) 
+h_adj <- as(h_adj, "dgTMatrix") # sparse style matrix conversion
+saveRDS(h_adj, "./data/neighborhood_queen.RDS")
+```
+
+### 2. Data preparation
+
+Load spatial structure, filter missing data, add unique ID for `GEOID`, round climate data to decrease computation time, build priors for all models:
+
+```{r message=F, warning=F}
+# load adjacency matrix
+hadj <- readRDS("./data/neighborhood.RDS") # rook
+
+# other data prep in BS_load.R
+```
+
+Counties included in final null dataset:
+
+```{r}
+y <- null %>% group_by(GEOID) %>% summarize(mnYIELD = mean(YIELD, na.rm=T))
+cty_check <- merge(county_sub, y, by = "GEOID", all=T)
+spplot(cty_check, "mnYIELD")
+```
+
+### 3. Data overview
+
+Number of counties with available data in each of the LRR groups:
+
+```{r}
+library(RColorBrewer)
+r <- null %>% group_by(LRR) %>% summarize(n = length(unique(GEOID)))
+reg_plot <- merge(as(lrr_shp, "Spatial"), r, by.x="ID", by.y = "LRR")
+my.palette <- brewer.pal(n = 9, name = "OrRd")
+spplot(reg_plot, "n", col.regions = my.palette, cuts=8, col = "gray")
+```
+
+```{r}
+library(knitr)
+kable(reg_plot)
+```
+
+### 4. LRR model
+
+This got quite long, so all of the model development and sensitivity testing is well-documented in the `Sensitivity_testing` document.  This doc also has full descriptions of the models to help with writing up methods.  Results are presented for:
+
+1.  A LRR-level model
+2.  An Level-II eco-region model
+
+State-level results performed worse than these models, but are in the Archive folder just in case (`null_STATE.RDS` with code in `BS_analysis_June19.RMD`).
+
+#### Model specification
+
+```{r eval=F}
+# Define priors
+apar <- 0.5
+lmod <- lm(YIELD ~ GDD + SDD + EFP + EXP + CORN_SUIT + factor(YEAR), null)
+bpar <- apar*var(residuals(lmod))
+lgprior_iid <- list(prec = list(prior="loggamma", param = c(apar,bpar)))
+sdres <- sd(residuals(lmod))
+lgprior_bym <- list(prec = list(prior="pc.prec", param = c(3*sdres, 0.01)))
+u <- 0.6
+
+# Specify formula
+formula <- YIELD ~ 1 + f(ID, model="bym2", # county-level spatial structure
+    graph=hadj,
+    scale.model=TRUE,
+    constr = TRUE,
+    hyper= lgprior_bym) +
+  CORN_SUIT +
+  f(LRR, model = "iid", hyper = lgprior_iid) + 
+  f(GDD, model = "rw1", scale.model = T, constr = T, hyper = list(theta = list(prior = "pc.prec",
+                                                                   param = c(u, 0.01)))) +
+  f(SDD, model = "rw1", scale.model = T, constr = T, hyper = list(theta = list(prior = "pc.prec",
+                                                                   param = c(u, 0.01)))) +
+  f(TP, model = "rw1", scale.model = T, constr = T, hyper = list(theta = list(prior = "pc.prec",
+                                                                   param = c(u, 0.01)))) +
+  factor(YEAR)
+
+modr <- inla(formula, data=null, family="gaussian",
+           control.predictor = list(compute=T), 
+           control.compute = list(dic=T, cpo=T))
+# d <- model_diagnostics(modr, null)
+saveRDS(modr, "./out/null_LRR.RDS")
+```
+
+#### Model results
+
+```{r}
+modr <- readRDS("./out/null_LRR.RDS")
+modd <- model_diagnostics(modr, null)
+```
+
+Precision estimates are all small, fixed effects make intuitive sense.  Deviance is reasonable as compared to other models.  
+
+```{r}
+summary(modr)
+```
+
+Assess non-linearities:
+
+```{r}
+sdd <- nonlinear_effect(modr, "SDD")
+gdd <- nonlinear_effect(modr, "GDD")
+tp <- nonlinear_effect(modr, "TP")
+sdd
+gdd
+tp
+```
+
+GDD and SDD reflect known and well-documented relationships.  TP response curve is odd. How about area-specific residuals (ui). These are the `modr$summary.random$ID[1:n, c(1, 2, 3)]` values.  
+
+```{r}
+modcty <- spatial_effects(modr, null, level="ID")
+modcty
+```
+
+Now for the spatially-structured residuals only:
+
+```{r}
+modres <- spatial_residuals(modr, null, level="ID")
+modres
+```
+
+How about regional (LRR) effects:
+
+```{r}
+modlrr <- spatial_effects(modr, null, level="LRR")
+modlrr
+```
+
+Look at residuals:
+
+```{r}
+res.lin <- (null$YIELD - modr$summary.fitted.values$mean)/modr$summary.fitted.values$sd  # summary of presducted mu hat values
+hist(res.lin, 100)
+```
+
+#### Model diagnostics
+
+How about general model diagnostics:
+
+```{r}
+modd$DIC
+modd$CPO
+modd$MSE
+modd$R2
+```
+
+The probability integral transform (PIT) is another leave-one-out-cross-validation check that evaluates the predictive performance of the model where a Uniform distribution of PIT means the predictive distribution matches well with the data. In our case, the thing tends towards uniform, with some extreme values in both directions (consider trimming or inspecting these outliers).
+
+```{r}
+modd$PIT
+```
+
+The first PPC shows a scatterplot of the posterior means for the predictive distribution and observed values, where points scattered along a line of slope 1 indicates a very good fit. 
+
+```{r}
+modd$PPC_PT
+```
+
+The second PPC provides a histogram of the posterior predictive p-value which estimates the probability of predicting a value more extreme than the observed value, where values near 0 and 1 indicate that the model does not adequately account for the tails of the observed distribution. The tails are due to isolated county-year events which seem to correspond with disaster records.
+
+```{r}
+modd$PPC_HIST
+```
+
+Finally, compute the proportion of variance explained by the structured spatial component:
+
+```{r}
+# p.186, only if scale.model=T
+marg.hyper <- inla.hyperpar.sample(100000, modr)
+pv <- mean(marg.hyper[,1]/(marg.hyper[,1]+marg.hyper[,2]))
+```
+
+The proportion of spatial variance is `r pv` suggesting that a significant amount of the variaiblity is explained by spatial structure.
+
+#### LRR bright spots
+
+```{r eval=T}
+lrr <- find_bs(modr, null, level = "LRR", th=2)
+mdp <- brewer.pal(n = 9, name = "BrBG")
+lrr.layer <- list("sp.polygons", as(lrr_shp, "Spatial"), col = "gray", first=F)
+
+spplot(lrr, "DIFF", main = "Difference between regional and county effects", col.regions = mdp, cuts = 8, col = "transparent", sp.layout = lrr.layer)
+```
+
+```{r}
+plot_bsds(lrr) 
+```
+
+```{r}
+lrr <- find_bs(modr, null, level = "LRR", th=1.5)
+plot_bsds(lrr)
+```
+
+***
+
+### 5. ECO model
+
+#### Model specification
+
+```{r eval=F}
+# Define priors
+apar <- 0.5
+lmod <- lm(YIELD ~ GDD + SDD + EFP + EXP + CORN_SUIT + factor(YEAR), null)
+bpar <- apar*var(residuals(lmod))
+lgprior_iid <- list(prec = list(prior="loggamma", param = c(apar,bpar)))
+sdres <- sd(residuals(lmod))
+lgprior_bym <- list(prec = list(prior="pc.prec", param = c(3*sdres, 0.01)))
+u <- 0.6
+
+# Specify formula
+formula <- YIELD ~ 1 + f(ID, model="bym2", # county-level spatial structure
+    graph=hadj,
+    scale.model=TRUE,
+    constr = TRUE,
+    hyper= lgprior_bym) +
+  CORN_SUIT +
+  f(ECO, model = "iid", hyper = lgprior_iid) + 
+  f(GDD, model = "rw1", scale.model = T, constr = T, hyper = list(theta = list(prior = "pc.prec",
+                                                                   param = c(u, 0.01)))) +
+  f(SDD, model = "rw1", scale.model = T, constr = T, hyper = list(theta = list(prior = "pc.prec",
+                                                                   param = c(u, 0.01)))) +
+  f(TP, model = "rw1", scale.model = T, constr = T, hyper = list(theta = list(prior = "pc.prec",
+                                                                   param = c(u, 0.01)))) +
+  factor(YEAR)
+
+modr <- inla(formula, data=null, family="gaussian",
+           control.predictor = list(compute=T), 
+           control.compute = list(dic=T, cpo=T))
+# d <- model_diagnostics(modr, null)
+saveRDS(modr, "./out/null_ECO.RDS")
+```
+
+#### Model results
+
+```{r}
+modr <- readRDS("./out/null_ECO.RDS")
+modd <- model_diagnostics(modr, null)
+```
+
+Precision estimates are all small, fixed effects make intuitive sense.  Deviance is reasonable as compared to other models.  
+
+```{r}
+summary(modr)
+```
+
+Assess non-linearities:
+
+```{r}
+sdd <- nonlinear_effect(modr, "SDD")
+gdd <- nonlinear_effect(modr, "GDD")
+tp <- nonlinear_effect(modr, "TP")
+sdd
+gdd
+tp
+```
+
+GDD and SDD reflect known and well-documented relationships.  TP response curve is odd. How about area-specific residuals (ui). These are the `modr$summary.random$ID[1:n, c(1, 2, 3)]` values.  
+
+```{r}
+modcty <- spatial_effects(modr, null, level="ID")
+modcty
+```
+
+Now for the spatially-structured residuals only:
+
+```{r}
+modres <- spatial_residuals(modr, null, level="ID")
+modres
+```
+
+How about regional (ECO) effects:
+
+```{r}
+modeco <- spatial_effects(modr, null, level="ECO")
+modlrr
+```
+
+Look at residuals:
+
+```{r}
+res.lin <- (null$YIELD - modr$summary.fitted.values$mean)/modr$summary.fitted.values$sd  # summary of presducted mu hat values
+hist(res.lin, 100)
+```
+
+#### Model diagnostics
+
+How about general model diagnostics:
+
+```{r}
+modd$DIC
+modd$CPO
+modd$MSE
+modd$R2
+```
+
+The probability integral transform (PIT) is another leave-one-out-cross-validation check that evaluates the predictive performance of the model where a Uniform distribution of PIT means the predictive distribution matches well with the data. In our case, the thing tends towards uniform, with some extreme values in both directions (consider trimming or inspecting these outliers).
+
+```{r}
+modd$PIT
+```
+
+The first PPC shows a scatterplot of the posterior means for the predictive distribution and observed values, where points scattered along a line of slope 1 indicates a very good fit. 
+
+```{r}
+modd$PPC_PT
+```
+
+The second PPC provides a histogram of the posterior predictive p-value which estimates the probability of predicting a value more extreme than the observed value, where values near 0 and 1 indicate that the model does not adequately account for the tails of the observed distribution. The tails are due to isolated county-year events which seem to correspond with disaster records.
+
+```{r}
+modd$PPC_HIST
+```
+
+Finally, compute the proportion of variance explained by the structured spatial component:
+
+```{r}
+# p.186, only if scale.model=T
+marg.hyper <- inla.hyperpar.sample(100000, modr)
+pv <- mean(marg.hyper[,1]/(marg.hyper[,1]+marg.hyper[,2]))
+```
+
+The proportion of spatial variance is `r pv` suggesting that a significant amount of the variaiblity is explained by spatial structure.
+
+#### ECO bright spots
+
+```{r eval=T}
+lrr <- find_bs(modr, null, level = "ECO", th=2)
+mdp <- brewer.pal(n = 9, name = "BrBG")
+lrr.layer <- list("sp.polygons", as(lrr_shp, "Spatial"), col = "gray", first=F)
+
+spplot(lrr, "DIFF", main = "Difference between regional and county effects", col.regions = mdp, cuts = 8, col = "transparent", sp.layout = lrr.layer)
+```
+
+```{r}
+plot_bsds(lrr) 
+```
+
+```{r}
+lrr <- find_bs(modr, null, level = "ECO", th=1.5)
+plot_bsds(lrr)
+```
+
+***
+
+### 6. STATE model
+
+#### Model specification
+
+```{r eval=F}
+# Define priors
+apar <- 0.5
+lmod <- lm(YIELD ~ GDD + SDD + EFP + EXP + CORN_SUIT + factor(YEAR), null)
+bpar <- apar*var(residuals(lmod))
+lgprior_iid <- list(prec = list(prior="loggamma", param = c(apar,bpar)))
+sdres <- sd(residuals(lmod))
+lgprior_bym <- list(prec = list(prior="pc.prec", param = c(3*sdres, 0.01)))
+u <- 0.6
+
+# Specify formula
+formula <- YIELD ~ 1 + f(ID, model="bym2", # county-level spatial structure
+    graph=hadj,
+    scale.model=TRUE,
+    constr = TRUE,
+    hyper= lgprior_bym) +
+  CORN_SUIT +
+  f(STATE, model = "iid", hyper = lgprior_iid) + 
+  f(GDD, model = "rw1", scale.model = T, constr = T, hyper = list(theta = list(prior = "pc.prec",
+                                                                   param = c(u, 0.01)))) +
+  f(SDD, model = "rw1", scale.model = T, constr = T, hyper = list(theta = list(prior = "pc.prec",
+                                                                   param = c(u, 0.01)))) +
+  f(TP, model = "rw1", scale.model = T, constr = T, hyper = list(theta = list(prior = "pc.prec",
+                                                                   param = c(u, 0.01)))) +
+  factor(YEAR)
+
+modr <- inla(formula, data=null, family="gaussian",
+           control.predictor = list(compute=T), 
+           control.compute = list(dic=T, cpo=T))
+# d <- model_diagnostics(modr, null)
+saveRDS(modr, "./out/null_STATE.RDS")
+```
+
+#### Model results
+
+```{r}
+modr <- readRDS("./out/null_STATE.RDS")
+modd <- model_diagnostics(modr, null)
+```
+
+Precision estimates are all small, fixed effects make intuitive sense.  Deviance is reasonable as compared to other models.  
+
+```{r}
+summary(modr)
+```
+
+Assess non-linearities:
+
+```{r}
+sdd <- nonlinear_effect(modr, "SDD")
+gdd <- nonlinear_effect(modr, "GDD")
+tp <- nonlinear_effect(modr, "TP")
+sdd
+gdd
+tp
+```
+
+GDD and SDD reflect known and well-documented relationships.  TP response curve is odd. How about area-specific residuals (ui). These are the `modr$summary.random$ID[1:n, c(1, 2, 3)]` values.  
+
+```{r}
+modcty <- spatial_effects(modr, null, level="ID")
+modcty
+```
+
+Now for the spatially-structured residuals only:
+
+```{r}
+modres <- spatial_residuals(modr, null, level="ID")
+modres
+```
+
+Look at residuals:
+
+```{r}
+res.lin <- (null$YIELD - modr$summary.fitted.values$mean)/modr$summary.fitted.values$sd  # summary of presducted mu hat values
+hist(res.lin, 100)
+```
+
+#### Model diagnostics
+
+How about general model diagnostics:
+
+```{r}
+modd$DIC
+modd$CPO
+modd$MSE
+modd$R2
+```
+
+The probability integral transform (PIT) is another leave-one-out-cross-validation check that evaluates the predictive performance of the model where a Uniform distribution of PIT means the predictive distribution matches well with the data. In our case, the thing tends towards uniform, with some extreme values in both directions (consider trimming or inspecting these outliers).
+
+```{r}
+modd$PIT
+```
+
+The first PPC shows a scatterplot of the posterior means for the predictive distribution and observed values, where points scattered along a line of slope 1 indicates a very good fit. 
+
+```{r}
+modd$PPC_PT
+```
+
+The second PPC provides a histogram of the posterior predictive p-value which estimates the probability of predicting a value more extreme than the observed value, where values near 0 and 1 indicate that the model does not adequately account for the tails of the observed distribution. The tails are due to isolated county-year events which seem to correspond with disaster records.
+
+```{r}
+modd$PPC_HIST
+```
+
+Finally, compute the proportion of variance explained by the structured spatial component:
+
+```{r}
+# p.186, only if scale.model=T
+marg.hyper <- inla.hyperpar.sample(100000, modr)
+pv <- mean(marg.hyper[,1]/(marg.hyper[,1]+marg.hyper[,2]))
+```
+
+The proportion of spatial variance is `r pv` suggesting that a significant amount of the variaiblity is explained by spatial structure.
+
+#### STATE bright spots
+
+```{r eval=T}
+lrr <- find_bs(modr, null, level = "STATE", th=2)
+mdp <- brewer.pal(n = 9, name = "BrBG")
+lrr.layer <- list("sp.polygons", as(lrr_shp, "Spatial"), col = "gray", first=F)
+
+spplot(lrr, "DIFF", main = "Difference between regional and county effects", col.regions = mdp, cuts = 8, col = "transparent", sp.layout = lrr.layer)
+```
+
+```{r}
+plot_bsds(lrr) 
+```
+
+```{r}
+lrr <- find_bs(modr, null, level = "STATE", th=1.5)
+plot_bsds(lrr)
+```
+
+***
+
+### 6. National-scale BS/DS
+
+Results here use county-effects from the LRR model described above:
+
+```{r eval=T}
+modr <- readRDS("./out/null_LRR.RDS")
+lrr <- national_bs(modr, null, th=2)
+mdp <- brewer.pal(n = 9, name = "BrBG")
+lrr.layer <- list("sp.polygons", as(lrr_shp, "Spatial"), col = "gray", first=F)
+
+spplot(lrr, "DIFF", main = "Difference between county effects and national mean", col.regions = mdp, cuts = 8, col = "transparent", sp.layout = lrr.layer)
+```
+
+```{r}
+plot_bsds(lrr) 
+```
+
+```{r}
+lrr <- national_bs(modr, null, th=1.5)
+plot_bsds(lrr) 
+```
+
+
+
+### 7. LRR model plus predictors
+
+#### Model specification
+
+```{r eval=F}
+# Define priors
+apar <- 0.5
+lmod <- lm(YIELD ~ GDD + SDD + EFP + EXP + CORN_SUIT + factor(YEAR), nulli)
+bpar <- apar*var(residuals(lmod))
+lgprior_iid <- list(prec = list(prior="loggamma", param = c(apar,bpar)))
+sdres <- sd(residuals(lmod))
+lgprior_bym <- list(prec = list(prior="pc.prec", param = c(3*sdres, 0.01)))
+u <- 0.6
+
+# Specify formula
+formula <- YIELD ~ 1 + f(ID, model="bym2", # county-level spatial structure
+    graph=hadj,
+    scale.model=TRUE,
+    constr = TRUE,
+    hyper= lgprior_bym) +
+  CORN_SUIT +
+  female +
+  tenant +
+  age +
+  labor_expense +
+  chem +
+  machinery +
+  irrig +
+  gvt_prog +
+  ph_corn +
+  cty_cl +
+  PERC_NATURAL_COVER +
+  SDI_NOMASK +
+  ED_NOMASK +
+  RICH_NOMASK +
+  LPI_NOMASK +
+  f(LRR, model = "iid", hyper = lgprior_iid) + 
+  f(GDD, model = "rw1", scale.model = T, constr = T, hyper = list(theta = list(prior = "pc.prec",
+                                                                   param = c(u, 0.01)))) +
+  f(SDD, model = "rw1", scale.model = T, constr = T, hyper = list(theta = list(prior = "pc.prec",
+                                                                   param = c(u, 0.01)))) +
+  f(TP, model = "rw1", scale.model = T, constr = T, hyper = list(theta = list(prior = "pc.prec",
+                                                                   param = c(u, 0.01)))) +
+  # f(chem, model = "rw1", scale.model = T, constr = T, hyper = list(theta = list(prior = "pc.prec",
+  #                                                                  param = c(u, 0.01)))) +
+  #   f(machinery, model = "rw1", scale.model = T, constr = T, hyper = list(theta = list(prior = "pc.prec",
+  #                                                                  param = c(u, 0.01)))) +
+  #  f(irrig, model = "rw1", scale.model = T, constr = T, hyper = list(theta = list(prior = "pc.prec",
+  #                                                                  param = c(u, 0.01)))) +
+  #  f(gvt_prog, model = "rw1", scale.model = T, constr = T, hyper = list(theta = list(prior = "pc.prec",
+  #                                                                  param = c(u, 0.01)))) +
+  #  f(ph_corn, model = "rw1", scale.model = T, constr = T, hyper = list(theta = list(prior = "pc.prec",
+  #                                                                  param = c(u, 0.01)))) +
+  #  f(cty_cl, model = "rw1", scale.model = T, constr = T, hyper = list(theta = list(prior = "pc.prec",
+  #                                                                  param = c(u, 0.01)))) +
+  #    f(PERC_NATURAL_COVER, model = "rw1", scale.model = T, constr = T, hyper = list(theta = list(prior = "pc.prec",
+  #                                                                  param = c(u, 0.01)))) +
+  #    f(RICH_NOMASK, model = "rw1", scale.model = T, constr = T, hyper = list(theta = list(prior = "pc.prec",
+  #                                                                  param = c(u, 0.01)))) +
+  #    f(ED_NOMASK, model = "rw1", scale.model = T, constr = T, hyper = list(theta = list(prior = "pc.prec",
+  #                                                                  param = c(u, 0.01)))) +
+  #    f(LPI_NOMASK, model = "rw1", scale.model = T, constr = T, hyper = list(theta = list(prior = "pc.prec",
+  #                                                                  param = c(u, 0.01)))) +
+  #    f(SDI_NOMASK, model = "rw1", scale.model = T, constr = T, hyper = list(theta = list(prior = "pc.prec",
+  #                                                                  param = c(u, 0.01)))) +
+  factor(YEAR)
+
+# nulli$chem<-round(nulli$chem,-1) 
+# nulli$machinery<-round(nulli$machinery,-1) 
+# nulli$irrig<-round(nulli$irrig,-1) 
+# nulli$gvt_prog<-round(nulli$gvt_prog,-1) 
+# nulli$ph_corn<-round(nulli$ph_corn,-1) 
+# nulli$cty_cl<-round(nulli$cty_cl,-1) 
+# nulli$PERC_NATURAL_COVER<-round(nulli$PERC_NATURAL_COVER,-1) 
+# nulli$RICH_NOMASK<-round(nulli$RICH_NOMASK,-1) 
+# nulli$ED_NOMASK<-round(nulli$ED_NOMASK,-1) 
+# nulli$LPI_NOMASK<-round(nulli$LPI_NOMASK,-1) 
+# nulli$SDI_NOMASK<-round(nulli$SDI_NOMASK,-1) 
+nulli1 <- merge(nulli, county_sub@data, by = "GEOID", all = T)
+
+modr <- inla(formula, data=nulli1, family="gaussian",
+           control.predictor = list(compute=T), 
+           control.compute = list(dic=T, cpo=T))
+# d <- model_diagnostics(modr, null)
+saveRDS(modr, "./out/null_LRR_preds.RDS")
+```
+
+#### Model results
+
+```{r}
+nulli1 <- merge(nulli, county_sub@data, by = "GEOID", all = T)
+modr <- readRDS("./out/null_LRR_preds.RDS")
+modd <- model_diagnostics(modr, nulli1)
+```
+
+Precision estimates are all small, fixed effects make intuitive sense.  Deviance is reasonable as compared to other models.  
+
+```{r}
+summary(modr)
+```
+
+Assess non-linearities:
+
+```{r}
+sdd <- nonlinear_effect(modr, "SDD")
+gdd <- nonlinear_effect(modr, "GDD")
+tp <- nonlinear_effect(modr, "TP")
+sdd
+gdd
+tp
+```
+
+GDD and SDD reflect known and well-documented relationships.  TP response curve is odd. How about area-specific residuals (ui). These are the `modr$summary.random$ID[1:n, c(1, 2, 3)]` values.  
+
+```{r}
+modcty <- spatial_effects(modr, nulli1, level="ID")
+modcty
+```
+
+Now for the spatially-structured residuals only:
+
+```{r}
+modres <- spatial_residuals(modr, nulli1, level="ID")
+modres
+```
+
+How about regional (LRR) effects:
+
+```{r}
+modlrr <- spatial_effects(modr, nulli1, level="LRR")
+modlrr
+```
+
+Look at residuals:
+
+```{r}
+res.lin <- (nulli1$YIELD - modr$summary.fitted.values$mean)/modr$summary.fitted.values$sd  # summary of presducted mu hat values
+hist(res.lin, 100)
+```
+
+#### Model diagnostics
+
+How about general model diagnostics:
+
+```{r}
+modd$DIC
+modd$CPO
+modd$MSE
+modd$R2
+```
+
+The probability integral transform (PIT) is another leave-one-out-cross-validation check that evaluates the predictive performance of the model where a Uniform distribution of PIT means the predictive distribution matches well with the data. In our case, the thing tends towards uniform, with some extreme values in both directions (consider trimming or inspecting these outliers).
+
+```{r}
+modd$PIT
+```
+
+The first PPC shows a scatterplot of the posterior means for the predictive distribution and observed values, where points scattered along a line of slope 1 indicates a very good fit. 
+
+```{r}
+modd$PPC_PT
+```
+
+The second PPC provides a histogram of the posterior predictive p-value which estimates the probability of predicting a value more extreme than the observed value, where values near 0 and 1 indicate that the model does not adequately account for the tails of the observed distribution. The tails are due to isolated county-year events which seem to correspond with disaster records.
+
+```{r}
+modd$PPC_HIST
+```
+
+Finally, compute the proportion of variance explained by the structured spatial component:
+
+```{r}
+# p.186, only if scale.model=T
+marg.hyper <- inla.hyperpar.sample(100000, modr)
+pv <- mean(marg.hyper[,1]/(marg.hyper[,1]+marg.hyper[,2]))
+```
+
+The proportion of spatial variance is `r pv` suggesting that a significant amount of the variaiblity is explained by spatial structure.
+
+#### LRR predictor bright spots
+
+```{r eval=T}
+lrr <- find_bs(modr, nulli1, level = "LRR", th=2)
+mdp <- brewer.pal(n = 9, name = "BrBG")
+lrr.layer <- list("sp.polygons", as(lrr_shp, "Spatial"), col = "gray", first=F)
+
+spplot(lrr, "DIFF", main = "Difference between regional and county effects", col.regions = mdp, cuts = 8, col = "transparent", sp.layout = lrr.layer)
+```
+
+```{r}
+plot_bsds(lrr) 
+```
+
+```{r}
+lrr <- find_bs(modr, nulli1, level = "LRR", th=1.5)
+plot_bsds(lrr)
+```
+ 
+
+### 8. LRR model corn dominant
+
+#### Model specification
+
+```{r eval=F}
+# Define priors
+apar <- 0.5
+lmod <- lm(YIELD ~ GDD + SDD + EFP + EXP + CORN_SUIT + factor(YEAR), nulli)
+bpar <- apar*var(residuals(lmod))
+lgprior_iid <- list(prec = list(prior="loggamma", param = c(apar,bpar)))
+sdres <- sd(residuals(lmod))
+lgprior_bym <- list(prec = list(prior="pc.prec", param = c(3*sdres, 0.01)))
+u <- 0.6
+
+# Specify formula
+formula <- YIELD ~ 1 + f(ID, model="bym2", # county-level spatial structure
+    graph=hadj,
+    scale.model=TRUE,
+    constr = TRUE,
+    hyper= lgprior_bym) +
+  CORN_SUIT +
+  f(LRR, model = "iid", hyper = lgprior_iid) + 
+  f(GDD, model = "rw1", scale.model = T, constr = T, hyper = list(theta = list(prior = "pc.prec",
+                                                                   param = c(u, 0.01)))) +
+  f(SDD, model = "rw1", scale.model = T, constr = T, hyper = list(theta = list(prior = "pc.prec",
+                                                                   param = c(u, 0.01)))) +
+  f(TP, model = "rw1", scale.model = T, constr = T, hyper = list(theta = list(prior = "pc.prec",
+                                                                   param = c(u, 0.01)))) +
+   factor(YEAR)
+
+nulli2 <- merge(nulli, county_sub@data, by = "GEOID", all = T)
+nulli2 <- nulli2 %>% filter(ph_corn > 20)
+
+modr <- inla(formula, data=nulli2, family="gaussian",
+           control.predictor = list(compute=T), 
+           control.compute = list(dic=T, cpo=T))
+# d <- model_diagnostics(modr, null)
+saveRDS(modr, "./out/null_LRR_cornsub.RDS")
+```
+
+#### Model results
+
+```{r}
+nulli2 <- merge(nulli, county_sub@data, by = "GEOID", all = T)
+nulli2 <- nulli2 %>% filter(ph_corn > 20)
+modr <- readRDS("./out/null_LRR_cornsub.RDS")
+modd <- model_diagnostics(modr, nulli2)
+```
+
+Precision estimates are all small, fixed effects make intuitive sense.  Deviance is reasonable as compared to other models.  
+
+```{r}
+summary(modr)
+```
+
+Assess non-linearities:
+
+```{r}
+sdd <- nonlinear_effect(modr, "SDD")
+gdd <- nonlinear_effect(modr, "GDD")
+tp <- nonlinear_effect(modr, "TP")
+sdd
+gdd
+tp
+```
+
+GDD and SDD reflect known and well-documented relationships.  TP response curve is odd. How about area-specific residuals (ui). These are the `modr$summary.random$ID[1:n, c(1, 2, 3)]` values.  
+
+```{r}
+modcty <- spatial_effects(modr, nulli2, level="ID")
+modcty
+```
+
+Now for the spatially-structured residuals only:
+
+```{r}
+modres <- spatial_residuals(modr, nulli2, level="ID")
+modres
+```
+
+How about regional (LRR) effects:
+
+```{r}
+modlrr <- spatial_effects(modr, nulli2, level="LRR")
+modlrr
+```
+
+Look at residuals:
+
+```{r}
+res.lin <- (nulli2$YIELD - modr$summary.fitted.values$mean)/modr$summary.fitted.values$sd  # summary of presducted mu hat values
+hist(res.lin, 100)
+```
+
+#### Model diagnostics
+
+How about general model diagnostics:
+
+```{r}
+modd$DIC
+modd$CPO
+modd$MSE
+modd$R2
+```
+
+The probability integral transform (PIT) is another leave-one-out-cross-validation check that evaluates the predictive performance of the model where a Uniform distribution of PIT means the predictive distribution matches well with the data. In our case, the thing tends towards uniform, with some extreme values in both directions (consider trimming or inspecting these outliers).
+
+```{r}
+modd$PIT
+```
+
+The first PPC shows a scatterplot of the posterior means for the predictive distribution and observed values, where points scattered along a line of slope 1 indicates a very good fit. 
+
+```{r}
+modd$PPC_PT
+```
+
+The second PPC provides a histogram of the posterior predictive p-value which estimates the probability of predicting a value more extreme than the observed value, where values near 0 and 1 indicate that the model does not adequately account for the tails of the observed distribution. The tails are due to isolated county-year events which seem to correspond with disaster records.
+
+```{r}
+modd$PPC_HIST
+```
+
+Finally, compute the proportion of variance explained by the structured spatial component:
+
+```{r}
+# p.186, only if scale.model=T
+marg.hyper <- inla.hyperpar.sample(100000, modr)
+pv <- mean(marg.hyper[,1]/(marg.hyper[,1]+marg.hyper[,2]))
+```
+
+The proportion of spatial variance is `r pv` suggesting that a significant amount of the variaiblity is explained by spatial structure.
+
+#### LRR corn dominant bright spots
+
+```{r eval=T}
+lrr <- find_bs(modr, nulli2, level = "LRR", th=2)
+mdp <- brewer.pal(n = 9, name = "BrBG")
+lrr.layer <- list("sp.polygons", as(lrr_shp, "Spatial"), col = "gray", first=F)
+
+spplot(lrr, "DIFF", main = "Difference between regional and county effects", col.regions = mdp, cuts = 8, col = "transparent", sp.layout = lrr.layer)
+```
+
+```{r}
+plot_bsds(lrr) 
+```
+
+```{r}
+lrr <- find_bs(modr, nulli2, level = "LRR", th=1.5)
+plot_bsds(lrr)
+```
+
+ 

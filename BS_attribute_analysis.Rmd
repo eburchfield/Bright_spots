@@ -1,0 +1,1495 @@
+---
+title: "Bright spot attribute analysis"
+author: "Emily Burchfield"
+output: html_document
+---
+
+## Bright spots attributes {.tabset .tabset-fade}
+
+Packages and files needed to run analysis loaded below. All notes on dataset construction can be found in the `BS_data_construction.html` file.
+
+```{r message=F, warning=F}
+source("BS_func.R")
+source("BS_load.R")
+```
+
+Null model dataset based on `r nrow(null)` observations across `r length(unique(null$YEAR))` years.
+
+### Initial variable selection
+
+```{r message=F, warning=F}
+# find BS
+modr <- readRDS("./out/null_LRR.RDS")
+lrr <- find_bs(modr, null, level = "LRR", th=1.5)
+
+# merge to indicators dataset
+nulli <- merge(nulli %>% select(-c(LRR)), lrr, by = "GEOID", all=T)
+nulli <- nulli %>%
+  filter(!is.na(BS_CAT)) 
+```
+
+Look and where most of the missing data is:
+
+```{r echo=F}
+qc <- as.data.frame(colSums(is.na(nulli)/nrow(nulli)))
+qc <- cbind(qc, rownames(qc)) %>% arrange(desc(qc$`colSums(is.na(nulli)/nrow(nulli))`)) %>% filter(qc$`colSums(is.na(nulli)/nrow(nulli))` > 0)
+colnames(qc) <- c("Missing data", "Variable")
+kable(qc)
+```
+
+And drop highly correlated variables. Using variables that have no real relationship with the response can cause deterioration in the test error rate; more reason to think through a variable selection procedure prior to running the logistic regression.  As in the Cinner et al paper, we keep covariates with correlation coefficients of 0.7:
+
+```{r message=F, warning=F}
+library(corrplot)
+varData <- nulli %>% 
+  select(-c(STATE_FIPS, YIELD, GDD, SDD, TP, EFP, EXP, ECO, CORN_SUIT, county, LRR, ID, 
+            STATE, COUNTY_MEAN, REGION_MEAN, DIFF, BS_CAT, GEOID, YEAR)) # remove data from null models
+vd <- varData %>% na.omit()
+res <- cor(vd)
+res <- as.data.frame(as.table(round(res,2))) 
+res <- res %>% arrange(desc(Freq)) %>% filter(Freq != 1) %>% mutate(aFreq = abs(Freq)) 
+corr <- res %>% filter(aFreq >= 0.7)
+```
+
+Update by dropping highly correlated landscape indices:
+
+* Keep only one indicator of diversity (`SDI_AGMASK` and `SDI_NOMASK`) and drop other indicators (`RICH*`, `BPD*`, `SIDI*`)
+* `IJI_AGMASK` is highly collinear with `SDI_AGMASK` (`0.85`), less common, and more complex to interpret, so it was dropped.  
+* `MODE_AG` and `MODE_ALL` are not particularly useful, but interesting.  They were dropped.  
+* Drop `MODE_AG` and `MODE_ALL` b/c not particularly useful in models.
+* Remaining collinearity is between `RPR*` and `SE*`.  `RPR` is much more common and easier to interpret, so it was kept in the models rather than the Simpson's Equality indicators.
+* Drop `PNC` b/c very collinear with cropland indicator 
+
+This resolves the correlation issues:
+
+```{r}
+varData <- nulli %>% 
+  select(-c(STATE_FIPS, YIELD, GDD, SDD, TP, EFP, EXP, ECO, CORN_SUIT, county, LRR, ID, 
+            STATE, COUNTY_MEAN, REGION_MEAN, DIFF, BS_CAT, GEOID, YEAR)) %>%
+  select(-c(RICH_AGMASK, RICH_NOMASK, SIDI_AGMASK, SIDI_NOMASK, BPD_AGMASK, BPD_NOMASK, IJI_AGMASK,
+            MODE_AGMASK, MODE_NOMASK, SE_NOMASK, SE_AGMASK, PERC_NATURAL_COVER))
+
+res <- cor(varData)
+res <- as.data.frame(as.table(round(res,2))) 
+res <- res %>% arrange(desc(Freq)) %>% filter(Freq != 1) %>% mutate(aFreq = abs(Freq))
+corr <- res %>% filter(aFreq >= 0.7)
+corr
+```
+
+Check for missing data in remaining variables:
+
+```{r}
+# contains missing data overview
+qc <- as.data.frame(colSums(is.na(varData)/nrow(varData)))
+qc <- cbind(qc, rownames(qc)) %>% arrange(desc(qc$`colSums(is.na(varData)/nrow(varData))`))
+```
+
+Drop predictors with more than 10 percent of their data missing:
+
+* `manure_acres` (24%) - will need to focus on other input indicators (fertilizer and chemicals)
+* `insur_acres` (22%) - does our `gvt_prog` include this?
+* `labor_n` (22%) - proxy with `labor_expense`
+* `acres_per_op` (22%) - this is really unfortunate not to include
+* `income` (22%) - yield is a proxy of income (correlation of `0.41`) and our BS are based on this
+* `insur_op` (22%) - hope that `gvt_prog` includes this
+* `exp` (22%) - proxy with `age`
+* `occup` (17%) - unfortunate we can't use, no real suitable proxy other than `age` which will serve as a rough indicator of experience
+* `PERC_IRR` (11%) - use `irrig` instead
+
+
+```{r}
+varData <- nulli %>% 
+  select(-c(STATE_FIPS, YIELD, GDD, SDD, TP, EFP, EXP, ECO, CORN_SUIT, county, LRR, ID, 
+            STATE, COUNTY_MEAN, REGION_MEAN, DIFF, BS_CAT, GEOID, YEAR)) %>%
+  select(-c(RICH_AGMASK, RICH_NOMASK, SIDI_AGMASK, SIDI_NOMASK, BPD_AGMASK, BPD_NOMASK, IJI_AGMASK,
+            MODE_AGMASK, MODE_NOMASK, SE_NOMASK, SE_AGMASK)) %>%
+  select(-c(manure_acres, insur_acres, labor_n, acres_per_op, income, insur_op, exp, occup, PERC_IRR))
+```
+
+The last step is to clean up the land use data from the Census, much of which is linearly dependent (e.g. one variable is a linear combination of others).  The following seem to be the most relevant to our analyses:
+
+* The percent havested acres in corn (`ph_corn`) as an indicator of the importance of corn to that county.
+* The percent operated land that is pasture (`perc_p`) which I see as a proxy for the importance of livestock in a particular agricultural system.
+* The percent of the total county that is devoted to agriculture (includes pasture) (`cty_cl`) as an indicator of the importance of agriculture to that county.
+* Drop `male` so baseline indicator of for a male
+* `cons_wetlands` and `cons_wet_acres` are covered in the `gvt_programs` indicator, so drop
+* Drop anything other than the aggregate `fert` and `chem` predictors (see BSDS_attributenotes10.1 for full justification).
+* What does `gvt_prog` include and how does this intersect with other predictors?  Covers income.
+* `income_farm`, `income`, `comm_sales`, and `crop_sales` - dropped b/c included largely in the `gvt_prog` predictor
+* Drop `part_owner` and keep only an indicator of full ownership and tenancy.
+* `SDI_NOMASK` with VIF well above 5 as well as `ED_NOMASK`
+
+```{r}
+varData <- nulli %>% 
+  select(-c(STATE_FIPS, YIELD, GDD, SDD, TP, EFP, EXP, ECO, CORN_SUIT, county, LRR, ID, 
+            STATE, COUNTY_MEAN, REGION_MEAN, DIFF, BS_CAT, GEOID, YEAR)) %>%
+  select(-c(SIDI_AGMASK, BPD_AGMASK, BPD_NOMASK, IJI_AGMASK,
+            MODE_AGMASK, MODE_NOMASK, SE_NOMASK, SE_AGMASK, PERC_NATURAL_COVER, SDI_NOMASK, SDI_AGMASK, 
+            RPR_NOMASK, RPR_AGMASK, SIDI_NOMASK, RICH_AGMASK)) %>%
+  select(-c(manure_acres, insur_acres, labor_n, acres_per_op, insur_op, exp, occup, PERC_IRR)) %>%
+  select(-c(perc_cl, perc_clp, perc_o, perc_p, perc_wle, perc_pe, perc_t, cty_al, cty_clp, 
+            cons_wetlands, cons_wet_acres)) %>%
+  select(-c(herb_acres, comm_sales, crop_sales, insect_acres, income_farm, part_owner, fert_acres, income, chem)) %>%
+  select(-c( male)) %>%
+  mutate(BS_BIN = as.factor(ifelse(nulli$BS_CAT == "Bright Spot", 1, 0)),
+         DS_BIN = as.factor(ifelse(nulli$BS_CAT == "Dark Spot", 1, 0)))
+```
+
+So the final list of potential predictors in the models run below are:
+
+```{r echo=F}
+colnames(varData)
+```
+
+
+### Final variable list 
+
+Farmer demographics
+
+* `age`
+* `female`, 
+* `full_owner` 
+* `tenant`
+
+Inputs
+
+* `fert` (versus `chem`)
+* `irrig`
+* `labor_expense`
+* `machinery`
+* `gvt_prog`
+
+
+Land use
+
+* `cty_cl`
+* `ph_corn`
+* `cty_pe`
+* `LPI_NOMASK`
+* `ED_NOMASK`
+* `IJI_NOMASK`
+* `SIDI_AGMASK`
+* `SIDI_NOMASK`
+
+```{r}
+# check for no wildly collinear variables
+vd <- varData %>% na.omit()
+res <- cor(vd %>% select(-c(BS_BIN, DS_BIN)))
+res <- as.data.frame(as.table(round(res,2))) 
+res <- res %>% arrange(desc(Freq)) %>% filter(Freq != 1) %>% mutate(aFreq = abs(Freq))
+corr <- res %>% filter(aFreq >= 0.7)
+corr
+```
+
+```{r message=F, warning=F}
+library(corrplot)
+res <- cor(varData[,1:(ncol(varData)-2)] %>% na.omit())
+corrplot(res, method = "circle", type = "upper")
+```
+
+```{r message=F, warning=F}
+library(corrplot)
+res <- cor(varData[,14:ncol(varData)-2] %>% na.omit())
+corrplot(res, method = "circle", type = "upper")
+```
+
+VIF from linear model with BS:
+
+```{r message=F, warning=F}
+library(car)
+bsm <- glm(BS_BIN ~ ., data = varData %>% select(-c(DS_BIN)), family= binomial(link="logit"))
+
+vif(bsm)
+```
+
+VIF from linear model with DS:
+
+```{r message=F, warning=F}
+dsm <- glm(BS_BIN ~ ., data = varData %>% select(-c(DS_BIN)), family= binomial(link="logit"))
+
+vif(dsm)
+```
+
+
+Descriptive statistics for each variable:
+
+```{r}
+summary(varData)
+```
+
+```{r message=F, warning=F}
+library(stargazer)
+stargazer(varData, type = "text", title="Descriptive statistics", digits=1)
+```
+
+
+
+
+
+
+### BS Random Forests (th=1.5)
+
+First, prepare `varData` for random forests by scaling and [dropping missing data](https://medium.com/airbnb-engineering/overcoming-missing-values-in-a-random-forest-classifier-7b1fc1fc03ba):
+
+```{r}
+# scale and drop NAs
+scaled = as.data.frame(scale(varData %>% select(-c(BS_BIN, DS_BIN))))
+scaled$BS_BIN <-as.factor(ifelse(nulli$BS_CAT == "Bright Spot", 1, 0))
+scaled$DS_BIN <-as.factor(ifelse(nulli$BS_CAT == "Dark Spot", 1, 0))
+rfData <- scaled %>% drop_na  
+
+# build training and testing datasets
+set.seed(1)
+random_rn <- sample(nrow(rfData), ceiling(nrow(rfData)*.25))
+train <- rfData[-random_rn,]
+ho <- rfData[random_rn,] 
+
+# tuneRF(x = train[,1:44], y = train$BS_BIN, ntreeTry = 501)
+rf_bs <- randomForest(formula = BS_BIN ~.,
+                   data = train %>% select(-c(DS_BIN)),
+                   importance = T,
+                   mtry = ncol(rfData) - 5)
+```
+
+Really good model performance:
+
+```{r}
+yhat <- predict(rf_bs, newdata = ho)
+mean((as.numeric(as.character(yhat)) - as.numeric(as.character(ho$BS_BIN)))^2) # test set MSE
+# importance(rf_bs) # mean decrease in accuracy in predictinos on the out of bag samples when a given variable is excluded from the model
+```
+
+```{r echo=F, mesasge=F, warning=F}
+imp <- varImpPlot(rf_bs)
+imp <- as.data.frame(imp)
+imp$varnames <- rownames(imp) # row names to column
+imp$varnames <- as.factor(imp$varnames)
+rownames(imp) <- NULL
+
+ggplot(imp, aes(x=reorder(varnames, MeanDecreaseAccuracy), y=MeanDecreaseAccuracy)) + 
+  geom_point() +
+  geom_segment(aes(x=varnames,xend=varnames,y=0,yend=MeanDecreaseAccuracy)) +
+  ylab("Importance") +
+  xlab("") +
+  coord_flip() +
+  theme_minimal() +
+  ggtitle("Bright spot variable importance") 
+```
+
+[Partial plots](http://ugrad.stat.ubc.ca/R/library/randomForest/html/partialPlot.html) give graphical depiction of the marginal effect of the variable on the class probability or response - this gives some directionality to predictive effects above.  The idea is to isolate changes made in predictions to solely come from a specific feature. The plots show the relative logit contribution of the variable on the class probability from the perspective of the model. In other words negative values (in the y-axis) mean that the positive class is less likely for that value of the independent variable (x-axis) according to the model. Similarly positive values mean that the positive class is more likely for that value of the independent variable according to the model. Clearly, zero implies no average impact on class probability according to the model.  Here, we pick predictors with VIF values above 20:
+
+```{r}
+partialPlot(rf_bs, train, "irrig")
+```
+
+```{r}
+partialPlot(rf_bs, train, "RICH_NOMASK")
+```
+
+```{r}
+partialPlot(rf_bs, train, "LPI_NOMASK")
+```
+
+```{r}
+partialPlot(rf_bs, train, "IJI_NOMASK")
+```
+
+
+```{r}
+partialPlot(rf_bs, train, "ED_NOMASK")
+```
+
+
+```{r}
+partialPlot(rf_bs, train, "tenant")
+```
+
+```{r}
+partialPlot(rf_bs, train, "cty_pe")
+```
+
+```{r}
+partialPlot(rf_bs, train, "cty_cl")
+```
+
+```{r}
+partialPlot(rf_bs, train, "labor_expense")
+```
+
+```{r}
+partialPlot(rf_bs, train, "ph_corn")
+```
+
+```{r}
+partialPlot(rf_bs, train, "gvt_prog")
+```
+
+```{r}
+partialPlot(rf_bs, train, "fert")
+```
+
+* [Good article to cite](https://digitalcommons.usu.edu/cgi/viewcontent.cgi?article=1805&context=wild_facpub), find other examples to figure out how to present results.
+
+### DS Random Forests (th = 1.5)
+
+```{r message=F, warning=F}
+rf_ds <- randomForest(formula = DS_BIN ~.,
+                   data = train %>% select(-c(BS_BIN)),
+                   importance = T,
+                   mtry = ncol(train) - 5)
+```
+
+Really good performance:
+
+```{r}
+yhat <- predict(rf_ds, newdata = ho)
+mean((as.numeric(as.character(yhat)) - as.numeric(as.character(ho$DS_BIN)))^2) # test set MSE
+```
+
+```{r echo=F, mesasge=F, warning=F}
+imp <- varImpPlot(rf_ds)
+imp <- as.data.frame(imp)
+imp$varnames <- rownames(imp) # row names to column
+rownames(imp) <- NULL  
+colnames(imp) <- c("MeanDecreaseAccuracy", "IncNodePurity", "varnames")
+
+ggplot(imp, aes(x=reorder(varnames, MeanDecreaseAccuracy), y=MeanDecreaseAccuracy)) + 
+  geom_point() +
+  geom_segment(aes(x=varnames,xend=varnames,y=0,yend=MeanDecreaseAccuracy), position=position_dodge(width=5)) +
+  ylab("% increase MSE") +
+  xlab("") +
+  coord_flip() +
+  theme_minimal() +
+  ggtitle("Dark spot variable importance")
+```
+
+#### DS Partial plots
+
+```{r}
+partialPlot(rf_ds, train, "irrig")
+```
+
+```{r}
+partialPlot(rf_ds, train, "ph_corn")
+```
+
+
+```{r}
+partialPlot(rf_ds, train, "LPI_NOMASK")
+```
+
+```{r}
+partialPlot(rf_ds, train, "IJI_NOMASK")
+```
+
+```{r}
+partialPlot(rf_ds, train, "age")
+```
+
+```{r}
+partialPlot(rf_ds, train, "female")
+```
+
+```{r}
+partialPlot(rf_ds, train, "tenant")
+```
+
+```{r}
+partialPlot(rf_ds, train, "ED_NOMASK")
+```
+
+```{r}
+partialPlot(rf_ds, train, "cty_pe")
+```
+
+### BS feature selection 
+
+A popular automatic method for feature selection provided by the caret R package is called Recursive Feature Elimination or RFE. A Random Forest algorithm is used on each iteration to evaluate the model. The algorithm is configured to explore all possible subsets of the attributes. 
+
+```{r eval=F}
+library(caret)
+
+# drop NAs as not permitted in predictors
+rfeData <- varData %>% na.omit()
+
+# define the control using a random forest selection function
+control <- rfeControl(functions=rfFuncs, method="cv", number=10)
+
+# run the RFE algorithm, takes a sec...
+results <- rfe(rfeData[,1:(ncol(rfeData) - 2)], rfeData$BS_BIN, sizes = c(seq(from=0, to=30, by=5)), rfeControl = control)
+
+# summarize the results
+print(results)
+
+# list the chosen features
+predictors(results)
+
+# plot the results
+plot(results, type=c("g", "o"))
+```
+
+* Model with 10 variables performs best
+* Following five selected: "irrig"              "SDI_AGMASK"         "LPI_NOMASK"         "IJI_NOMASK"         "PERC_NATURAL_COVER"
+ "RPR_NOMASK"         "RPR_AGMASK"         "SDI_NOMASK"         "ED_NOMASK"          "cty_pe" 
+
+### DS feature selection
+
+```{r eval=F}
+library(caret)
+
+# drop NAs as not permitted in predictors
+rfeData <- varData %>% na.omit()
+
+# define the control using a random forest selection function
+control <- rfeControl(functions=rfFuncs, method="cv", number=10)
+
+# run the RFE algorithm, takes a sec...
+results_ds <- rfe(rfeData[,1:(ncol(rfeData) - 2)], rfeData$DS_BIN, sizes = c(seq(from=0, to=30, by=5)), rfeControl = control)
+
+# summarize the results
+print(results_ds)
+
+# list the chosen features
+predictors(results_ds)
+
+# plot the results
+plot(results_ds, type=c("g", "o"))
+```
+
+* 5 variables best
+* "irrig"      "SDI_AGMASK" "LPI_NOMASK" "IJI_NOMASK" "ED_NOMASK" 
+
+### BS logistic regression (th=1.5):
+
+Logistic regression models the *probability* that Y belongs to a particular category (bright spot or dark spot in our case): $$ Pr(BS == 1 | X) $$ where X is our list of covariates.  We model $p(X)$ using a logistic function (to avoid estimates outside of the range 0 to 1).  Increasing X by one unit increases the log odds by $\beta_1$; but since the relationship between $p(x)$ and X is not a straight line, $\beta_1$ does not correspond to the change in $p(x)$ associated with a one-unit increase in X.  This depends on the current value of X.  We can interpret the beta coefficients listed below - a one-unit increase in the predictor is associated with a VALUE increase in the log odds of being a bright spot.   Note that in multivariate logistic space, this would be *given* the average values of other covariates in the model.  Note also that if I intend to use this in final paper, re-run as Bayesian.
+
+```{r}
+# build training and testing datasets
+set.seed(1)
+random_rn <- sample(nrow(varData), ceiling(nrow(varData)*.25))
+ho <- varData[random_rn,] 
+train <- varData[-random_rn,]
+
+mod <- glm(BS_BIN ~ ., data = train %>% select(-c(DS_BIN)), 
+           family = "binomial")
+summary(mod)
+```
+
+`predict()` predicts the probability of a county being a bright spot given the values of predictors.  `type=response` outputs probabilities in the form $$P(Y=1|X)$$ rather than logit.  If no dataset is supplied, `predict()` uses the dataset used to fit the logistic regression above.  Prediction on held out data:
+
+```{r}
+glm.probs = predict(mod, ho, type = "response") # testing rate error
+
+# compute predictions on HO and compare to actual observations
+glm.pred = rep(0, nrow(ho))
+glm.pred[glm.probs > 0.5] = 1
+table(glm.pred, ho$BS_BIN)
+mean(glm.pred == ho$BS_BIN)
+mean(glm.pred != ho$BS_BIN) # test set error rate
+```
+
+
+Higher AIC but much less complicated and addresses some of the data collinearlity and redundancy issues.  
+
+### DS logistic regression (th=1.5):
+
+```{r}
+# build training and testing datasets
+set.seed(1)
+random_rn <- sample(nrow(varData), ceiling(nrow(varData)*.25))
+ho <- varData[random_rn,] 
+train <- varData[-random_rn,]
+
+mod <- glm(DS_BIN ~ ., data = train %>% select(-c(BS_BIN)), 
+           family = "binomial")
+summary(mod)
+```
+
+```{r}
+glm.probs = predict(mod, ho, type = "response") # testing rate error
+
+# compute predictions on HO and compare to actual observations
+glm.pred = rep(0, nrow(ho))
+glm.pred[glm.probs > 0.5] = 1
+table(glm.pred, ho$DS_BIN)
+mean(glm.pred == ho$DS_BIN)
+mean(glm.pred != ho$DS_BIN) # test set error rate
+```
+
+### Multinomial logistic
+
+Multinomial versus ordinal decision a bit murky for us, but based on [this](https://www.theanalysisfactor.com/decide-between-multinomial-and-ordinal-logistic-regression-models/), "you can run a nominal model for an ordinal variable and not violate any assumptions. But you may not be answering the research question you’re really interested in if it incorporates the ordering." "In our data several changes in vegetation could have
+taken place between each observation. Therefore, for
+this model, it is assumed that succession of vegetation
+category does not tend to happen in any particular
+order and that the categories are strictly nominal." (From [this](https://besjournals.onlinelibrary.wiley.com/doi/pdf/10.1046/j.1365-2664.2001.00653.x))
+
+Multinomial logistic regression estimates a separate binary logistic regression model for each dummy variable.  Each model conveys the effect of predictors on the probability of success *in that category* in comparison to a reference category.  This way the predictors can effect each category differently.  Here, there's no assumption of ordinality.  
+Nice overview of this approach [here](https://stats.idre.ucla.edu/r/dae/multinomial-logistic-regression/).
+
+Prints out break-down of county-year count of BS/DS/AS:
+
+```{r message=F, warning=F}
+# standardize data for interpretability
+# mlData <- as.data.frame(scale(varData %>% select(-c(BS_BIN, DS_BIN))))
+# create categorical predictor
+mlData <- varData %>% select(-c(BS_BIN, DS_BIN))
+mlData$BS_CAT <- ifelse(varData$BS_BIN == 1, "Bright", NA)
+mlData$BS_CAT <- ifelse(varData$DS_BIN == 1, "Dark", mlData$BS_CAT)
+mlData$BS_CAT[is.na(mlData$BS_CAT)] <- "Average"
+mlData$BS_CAT <- as.factor(mlData$BS_CAT)
+# set baseline 
+mlData$BS_CAT <- relevel(mlData$BS_CAT, ref = "Average")
+
+# build training and testing datasets
+set.seed(1)
+random_rn <- sample(nrow(mlData), ceiling(nrow(mlData)*.25))
+ho <- mlData[random_rn,] 
+train <- mlData[-random_rn,]
+
+table(mlData$BS_CAT)
+```
+
+```{r message=F, warning=F}
+library(nnet)
+ml_out <- multinom(BS_CAT ~ ., data = train)
+summary(ml_out)
+
+# note that I can add splines like this:
+# library(splines)
+# ml_out <- multinom(BS_CAT ~ . + bs(SDI_NOMASK, 3), data = train %>% select(-c(BS_BIN, DS_BIN)))
+# summary(ml_out)
+
+# quadratic effects here
+# https://data.princeton.edu/wws509/r/c6s2
+```
+
+So the results starting with `Bright` are comparing the probability of being a `Bright` spot to the reference value of being `Average` and the `Dark` rows are for models comparing the probability of being a `Dark` spot to an `Average` spot.  For example, if the value of the `age` coefficient is -0.02, then this means that for a one year increase in a farmer's age, the logit coefficient (log odds) for `Bright` relative to `Average` will go down by 0.02.  So if your age goes up by one unit  your chances of staying in the `Average` category are high relative to staying as a bright spot.  Another way to describe these effects:  The coefficients represent the log-odds of membership in level *j* versus level 1 (baseline) of the response.
+
+These results are presented as log-odds, and are kind of messy to interpret.  To compute the *relative risk* (the ratio of the probability of being in one category over the probability of being in the baseline, or "Average" category), we can exponentiate the regression coefficients to compute the relative risk ratios for a one unit change in the predictor variable.  
+
+
+```{r message=F, warning=F}
+ml_exp <- exp(coef(ml_out))
+
+# results for publication
+library(stargazer)
+stargazer(ml_out, type = "html", out = "./fig/mnl_results.html")  
+```
+
+Adding significance:
+
+```{r}
+eff <- as.data.frame(t(ml_exp))
+eff$Variable <- rownames(eff)
+
+# add p-values, Wald test
+z <- summary(ml_out)$coefficients/summary(ml_out)$standard.errors
+# two tailed Z-test
+p <- (1-pnorm(abs(z), 0, 1)) * 2
+p <- as.data.frame(t(p))
+colnames(p) <- c("Bright_P", "Dark_P")
+p$Variable <- rownames(p)
+
+eff <- merge(eff, p, by = "Variable")
+eff$Bright_S <- as.factor(ifelse(eff$Bright_P > 0.05, "p > 0.05", "p < 0.05"))
+eff$Dark_S <- as.factor(ifelse(eff$Dark_P > 0.05, "p > 0.05", "p < 0.05"))
+```
+
+Ok, so now look at the coefficient of `Bright`-`age` which is `0.99`.  This means that if your age goes up one year, you are `0.99` times more likely to stay in the `Bright` category than to move to the `Average` category (the risk or odds is 1% lower).  Conversely, keeping all other variables constant, if your age goes up by one unit, you are `1.02` times more likely to stay in the `Dark` category than to move to the `Average` category (risk or odds is 2% higher).  This makes sense - as age increases, you're less likely to be a Bright Spot farmer.
+
+Think through interpretation of [standardized logit](https://stats.stackexchange.com/questions/353654/interpreting-coefficients-in-logistic-regression-after-standardizing-independent) a bit more.
+
+Let's work on a better way to visualize these relative risk results:
+
+```{r}
+# plot deviations from 1 by variable rather than absolute values for comparison ?
+# order lollipops
+eff$Bright_Delta <- eff$Bright - 1
+eff$Dark_Delta <- eff$Dark - 1
+
+eff <- eff %>% 
+  filter(Variable != "(Intercept)") %>% 
+  arrange(desc(Bright_Delta)) 
+
+ggplot() +
+  geom_segment(data = eff, aes(x = 0, y = Variable, xend = Bright_Delta, yend = Variable, color = Bright_S)) +
+  geom_point(data = eff, aes(x = Bright_Delta, y = Variable, color = Bright_S)) +
+  scale_color_manual(values = c("black", "red")) +
+  theme_minimal() +
+  theme(legend.title = element_blank()) +
+  xlab("Relative risk") +
+  ggtitle("Bright spots attributes") 
+```
+
+Or this plot which zooms in so we can see things a bit better:
+
+```{r eval=F}
+th <- 0.25
+eff_low <- eff %>% filter(abs(Bright_Delta) < th)
+eff_high <- eff %>% filter(abs(Bright_Delta) > th)
+eff_high$Bright_Delta_Temp <- ifelse(eff_high$Bright_Delta > 1,th, -th)
+ggplot() +
+  geom_segment(data = eff_low, aes(x = 0, y = Variable, xend = Bright_Delta, yend = Variable, color = Bright_S)) +
+  geom_point(data = eff_low, aes(x = Bright_Delta, y = Variable, color = Bright_S)) +
+  scale_color_manual(values = c("black", "red")) +
+  theme_minimal() +
+  theme(legend.title = element_blank()) +
+  xlab("Relative risk") +
+  ggtitle("Bright spot") +
+  xlim(c(-th-0.1, th+0.1)) +
+  geom_segment(data = eff_high, aes(x = 0, y = Variable, xend = Bright_Delta_Temp, yend = Variable, color = Bright_S)) +
+  geom_point(data = eff_high, aes(x = Bright_Delta_Temp, y = Variable, color = Bright_S), shape=8) +
+  geom_text(data = eff_high, aes(x = Bright_Delta_Temp, y = Variable, label = round(Bright_Delta, 2)),
+            hjust = 0, vjust = 1.2, size = 4)
+```
+
+```{r}
+ggplot() +
+  geom_segment(data = eff, aes(x = 0, y = Variable, xend = Dark_Delta, yend = Variable, color = Dark_S)) +
+  geom_point(data = eff, aes(x = Dark_Delta, y = Variable, color = Dark_S)) +
+  scale_color_manual(values = c("black", "red")) +
+  theme_minimal() +
+  theme(legend.title = element_blank()) +
+  xlab("Relative risk") +
+  ggtitle("Dark spots attributes") 
+```
+
+The `effects` documentation calculates [Anovas on results](https://stats.stackexchange.com/questions/63222/getting-p-values-for-multinom-in-r-nnet-package):
+
+```{r message=F, warning=F}
+library(car)
+Anova(ml_out)
+```
+
+Performance on held-out data and overall model fit statistics:
+
+```{r message=F, warning=F}
+prediction_scores <- predict(ml_out, ho, "probs")
+prediction_class <- predict(ml_out, ho)
+
+# confusion matrix
+table(prediction_class, ho$BS_CAT)
+# misclassification error
+mean(as.character(prediction_class) != as.character(ho$BS_CAT), na.rm=T)
+
+# pseudo R2, see this: https://www.rdocumentation.org/packages/DescTools/versions/0.99.19/topics/PseudoR2
+library(DescTools)
+PseudoR2(ml_out, which = "all")
+
+nnet.mod.loglik <- nnet:::logLik.multinom(ml_out)
+nnet.mod0 <- multinom(BS_CAT ~ 1, train)
+nnet.mod0.loglik <- nnet:::logLik.multinom(nnet.mod0)
+(nnet.mod.mfr2 <- as.numeric(1 - nnet.mod.loglik/nnet.mod0.loglik))
+
+```
+
+More resoures:
+
+* Result interpretation [here](https://www.analyticsvidhya.com/blog/2016/02/multinomial-ordinal-logistic-regression/).
+* PNAS paper using approach [here](https://www.pnas.org/content/pnas/106/42/17667.full.pdf)
+* Note that may need to test ILA assumption and possibly run a probit model instead - see [this paper](https://www.pnas.org/content/pnas/105/36/13286.full.pdf) that mentions this approach.
+
+```{r eval=F}
+library(mlogit)
+H <- mlogit.data(train, shape = "wide", choice = "BS_CAT")
+ml_out <- mlogit(BS_CAT ~ . | 0, H)
+hmftest(ml_out)
+```
+
+
+***
+
+The following scripts visualize the probability of being a bright/average/dark spot along a gradient of a particular covariate while holding all other predictors at their mean.
+
+We can be lazy and use the `effects` package which makes some ugly plots:  
+
+```{r eval=F}
+# effects package, file:///C:/Users/eburchf/Downloads/v32i01%20(1).pdf
+library(effects)
+# plot(Effect("SDI_NOMASK", ml_out)) # shows predictions with confidence bands
+plot(Effect("SDI_NOMASK", ml_out), multiline=T) # multiple lines in one plot.
+plot(Effect("SDI_NOMASK", ml_out), style = "stacked") # stacked vertical bar chart of predictions
+
+# effects on splines
+# sdi <- effect("bs(SDI_NOMASK, 3)", ml_out, 
+            #  xlevels = list(SDI_NOMASK = seq(min(mlData[,voi]), max(mlData[,voi]), length.out = nrow(mlData)),
+                        #     BS_CAT = c("Dark", "Average", "Bright"))) # add given values for other predictors as mean
+# plot(sdi)
+# plot(sdi, stype = "stacked", colors = c("blue", "red", "orange"), rug = F)
+```
+
+Or we can  do this outself to look at the predicted probabilities for different values of the continuous predictor of interest within each level of the model (Bright, Average, Dark):
+
+```{r}
+
+# reproduces effects plot but more transparent
+
+prob_plot <- function(voi, xlab, n = 500) {
+  t <- rep(seq(min(train[,voi], na.rm=T), 
+             max(train[,voi], na.rm=T), length.out = n), each=3)
+  tm <- as.data.frame.list(colMeans(train %>% select(-c(BS_CAT)), na.rm = T))
+  tm <- do.call("rbind.data.frame", replicate(length(t), tm, simplify=F))
+# tm$BS_CAT <- rep(c("Dark", "Average", "Bright"), n)
+  tm[,voi] <- t
+
+  pd <- cbind.data.frame(tm, predict(ml_out, newdata = tm, type = "probs", se = T))
+
+  sub <- gather(pd, "Category", "Probability", c((ncol(pd)-2):ncol(pd)))
+  p <- ggplot(data = sub) +
+  geom_line(aes(x = sub[,voi], y = Probability, color = Category), size=1.5) +
+  xlab(xlab) +
+  theme_minimal() +
+  theme(legend.title = element_blank()) +
+  scale_color_manual(values = c("#a9a9a9", "#4C9A2A", "#000080"), name = "")   +
+  ylim(c(0,1))
+  return(p)
+
+}
+
+prob_plot(voi = "RICH_NOMASK", xlab = "SDI of agricultural lands")
+prob_plot("LPI_NOMASK", xlab = "SDI of total landscape")
+prob_plot("ED_NOMASK", xlab = "Percent natural cover")
+prob_plot("IJI_NOMASK", xlab = "Percent natural cover")
+prob_plot("irrig", xlab = "Irrigation (% operated acres)")
+prob_plot("fert", xlab = "Fertilizer ($ per operated acre)")
+prob_plot("female", xlab = "Female operators (% operated acres)")
+prob_plot("full_owner", xlab = "Full owner operator (% operated acres)")
+prob_plot("tenant", xlab = "Tenant operator (% operated acres)")
+prob_plot("ph_corn", xlab = "Acres cultivated with corn (% harvested acres)")
+prob_plot("cty_cl", xlab = "Agricultural dominance (% county covered with cropland)")
+prob_plot("machinery", xlab = "Machinery ($ per operated acre)")
+prob_plot("labor_expense", xlab = "Labor expense ($ per operation)")
+
+```
+
+
+
+
+
+
+Here's another interesting way to do the same thing, but not based on simulated data:
+
+```{r eval=F}
+# another interesting way to visualize results
+# https://thomasleeper.com/Rcourse/Tutorials/nominalglm.html
+# first create data where the VOI with simulated range of VOI
+voi <- "SDI_NOMASK"
+xlab <- "SDI_NOMASK"
+
+newdata <- mlData %>% select(-c(voi)) %>% mutate(!!voi := seq(min(mlData[,voi]), max(mlData[,voi]), length.out = nrow(mlData)))
+
+p1 <- predict(ml_out, newdata, type = "class")
+p2 <- predict(ml_out, newdata, type = "probs")
+
+plot(NA, xlim = c(min(mlData[,voi]), max(mlData[,voi])), ylim = c(0, 1), xlab = xlab, ylab = "Predicted Probability")
+lines(newdata[,voi], p2[, 1], col = "red", lwd = 2)
+lines(newdata[,voi], p2[, 2], col = "blue", lwd = 2)
+lines(newdata[,voi], p2[, 3], col = "green", lwd = 2)
+# some text labels help clarify things:
+text(9, 0.75, "y==1", col = "red")
+text(6, 0.4, "y==3", col = "green")
+text(5, 0.15, "y==2", col = "blue")
+```
+
+
+### Std. Multinomial logistic
+
+```{r message=F, warning=F}
+# standardize data for interpretability
+mlData <- as.data.frame(scale(varData %>% select(-c(BS_BIN, DS_BIN))))
+# create categorical predictor
+mlData$BS_CAT <- ifelse(varData$BS_BIN == 1, "Bright", NA)
+mlData$BS_CAT <- ifelse(varData$DS_BIN == 1, "Dark", mlData$BS_CAT)
+mlData$BS_CAT[is.na(mlData$BS_CAT)] <- "Average"
+mlData$BS_CAT <- as.factor(mlData$BS_CAT)
+# set baseline 
+mlData$BS_CAT <- relevel(mlData$BS_CAT, ref = "Average")
+
+# build training and testing datasets
+set.seed(1)
+random_rn <- sample(nrow(mlData), ceiling(nrow(mlData)*.25))
+ho <- mlData[random_rn,] 
+train <- mlData[-random_rn,]
+
+table(mlData$BS_CAT)
+```
+
+```{r message=F, warning=F}
+library(nnet)
+ml_out <- multinom(BS_CAT ~ ., data = train)
+summary(ml_out)
+```
+
+```{r}
+ml_exp <- exp(coef(ml_out))
+```
+
+Wow, thanks [this post](https://www.andrewheiss.com/blog/2016/04/25/convert-logistic-regression-standard-errors-to-odds-ratios-with-r/):
+
+```{r}
+get.or.se <- function(model) {
+  broom::tidy(model) %>% 
+    mutate(or = exp(estimate),
+           var.diag = diag(vcov(model)),
+           or.se = sqrt(or^2 * var.diag)) %>%
+    select(or.se) %>% unlist %>% unname
+}
+
+se <- get.or.se(ml_out)
+
+```
+
+Adding significance:
+
+```{r}
+eff <- as.data.frame(t(ml_exp))
+eff$Variable <- rownames(eff)
+eff$SE_BS <- se[1:nrow(eff)]
+eff$SE_DS <- se[(nrow(eff)+1):length(se)]
+
+# add p-values, Wald test
+z <- summary(ml_out)$coefficients/summary(ml_out)$standard.errors
+# two tailed Z-test
+p <- (1-pnorm(abs(z), 0, 1)) * 2
+p <- as.data.frame(t(p))
+colnames(p) <- c("Bright_P", "Dark_P")
+p$Variable <- rownames(p)
+
+eff <- merge(eff, p, by = "Variable")
+eff$Bright_S <- as.factor(ifelse(eff$Bright_P > 0.05, "p > 0.05", "p < 0.05"))
+eff$Dark_S <- as.factor(ifelse(eff$Dark_P > 0.05, "p > 0.05", "p < 0.05"))
+```
+
+```{r}
+# plot deviations from 1 by variable rather than absolute values for comparison ?
+# order lollipops
+eff$Bright_Delta <- eff$Bright - 1
+eff$Dark_Delta <- eff$Dark - 1
+
+eff <- eff %>% 
+  filter(Variable != "(Intercept)") %>% 
+  arrange(desc(Bright_Delta)) 
+
+ggplot() +
+  geom_segment(data = eff, aes(x = 0, y = Variable, xend = Bright_Delta, yend = Variable, color = Bright_S)) +
+  geom_point(data = eff, aes(x = Bright_Delta, y = Variable, color = Bright_S)) +
+  scale_color_manual(values = c("black", "#A9A9A9")) +
+  theme_minimal() +
+  theme(legend.title = element_blank()) +
+  xlab("Relative risk") +
+  ggtitle("Bright spots attibutes") 
+
+
+
+```
+
+Showing SD, but not entirely the same thing as significance:
+
+```{r eval=F}
+eff$Bright_Delta <- eff$Bright - 1
+eff$Dark_Delta <- eff$Dark - 1
+
+eff <- eff %>% 
+  filter(Variable != "(Intercept)") %>% 
+  arrange(desc(Bright_Delta)) 
+
+ggplot(data = eff) +
+  # geom_segment(data = eff, aes(x = 0, y = Variable, xend = Bright_Delta, yend = Variable, color = Bright_S)) +
+  geom_errorbarh(width = 0, aes(xmin = Bright - SE_BS, xmax = Bright + SE_BS, y = Variable)) +
+  geom_point(data = eff, aes(x = Bright, y = Variable, color = Bright_S)) +
+  scale_color_manual(values = c("black", "#A9A9A9")) +
+  theme_minimal() +
+  theme(legend.title = element_blank()) +
+  xlab("Relative risk") +
+  ggtitle("Bright spots attributes") 
+```
+
+
+```{r}
+ggplot() +
+  geom_segment(data = eff, aes(x = 0, y = Variable, xend = Dark_Delta, yend = Variable, color = Dark_S)) +
+  geom_point(data = eff, aes(x = Dark_Delta, y = Variable, color = Dark_S)) +
+  scale_color_manual(values = c("black", "#A9A9A9")) +
+  theme_minimal() +
+  theme(legend.title = element_blank()) +
+  xlab("Relative risk") +
+  ggtitle("Dark spots attributes") 
+```
+
+Performance on held-out data and overall model fit statistics:
+
+```{r message=F, warning=F}
+prediction_scores <- predict(ml_out, ho, "probs")
+prediction_class <- predict(ml_out, ho)
+
+# confusion matrix
+table(prediction_class, ho$BS_CAT)
+# misclassification error
+mean(as.character(prediction_class) != as.character(ho$BS_CAT), na.rm=T)
+
+# pseudo R2, see this: https://www.rdocumentation.org/packages/DescTools/versions/0.99.19/topics/PseudoR2
+library(DescTools)
+PseudoR2(ml_out, which = "all")
+
+```
+
+```{r}
+
+# reproduces effects plot but more transparent
+
+prob_plot <- function(voi, xlab, n = 500) {
+  t <- rep(seq(min(train[,voi], na.rm=T), 
+             max(train[,voi], na.rm=T), length.out = n), each=3)
+  tm <- as.data.frame.list(colMeans(train %>% select(-c(BS_CAT)), na.rm = T))
+  tm <- do.call("rbind.data.frame", replicate(length(t), tm, simplify=F))
+# tm$BS_CAT <- rep(c("Dark", "Average", "Bright"), n)
+  tm[,voi] <- t
+
+  pd <- cbind.data.frame(tm, predict(ml_out, newdata = tm, type = "probs", se = T))
+
+  sub <- gather(pd, "Category", "Probability", c((ncol(pd)-2):ncol(pd)))
+  p <- ggplot(data = sub) +
+  geom_line(aes(x = sub[,voi], y = Probability, color = Category), size=1.5) +
+  xlab(xlab) +
+  theme_minimal() +
+  theme(legend.title = element_blank()) +
+  scale_color_manual(values = c("#a9a9a9", "#4C9A2A", "#000080"), name = "")   +
+  ylim(c(0,1))
+  return(p)
+
+}
+
+prob_plot(voi = "RICH_NOMASK", xlab = "SDI of agricultural lands")
+prob_plot("LPI_NOMASK", xlab = "SDI of total landscape")
+prob_plot("ED_NOMASK", xlab = "Percent natural cover")
+prob_plot("IJI_NOMASK", xlab = "Percent natural cover")
+prob_plot("irrig", xlab = "Irrigation (% operated acres)")
+prob_plot("fert", xlab = "Fertilizer ($ per operated acre)")
+prob_plot("female", xlab = "Female operators (% operated acres)")
+prob_plot("full_owner", xlab = "Full owner operator (% operated acres)")
+prob_plot("tenant", xlab = "Tenant operator (% operated acres)")
+prob_plot("ph_corn", xlab = "Acres cultivated with corn (% harvested acres)")
+prob_plot("cty_cl", xlab = "Agricultural dominance (% county covered with cropland)")
+prob_plot("machinery", xlab = "Machinery ($ per operated acre)")
+prob_plot("labor_expense", xlab = "Labor expense ($ per operation)")
+
+```
+
+
+
+
+
+
+Here's another interesting way to do the same thing, but not based on simulated data:
+
+```{r eval=F}
+# another interesting way to visualize results
+# https://thomasleeper.com/Rcourse/Tutorials/nominalglm.html
+# first create data where the VOI with simulated range of VOI
+voi <- "SDI_NOMASK"
+xlab <- "SDI_NOMASK"
+
+newdata <- mlData %>% select(-c(voi)) %>% mutate(!!voi := seq(min(mlData[,voi]), max(mlData[,voi]), length.out = nrow(mlData)))
+
+p1 <- predict(ml_out, newdata, type = "class")
+p2 <- predict(ml_out, newdata, type = "probs")
+
+plot(NA, xlim = c(min(mlData[,voi]), max(mlData[,voi])), ylim = c(0, 1), xlab = xlab, ylab = "Predicted Probability")
+lines(newdata[,voi], p2[, 1], col = "red", lwd = 2)
+lines(newdata[,voi], p2[, 2], col = "blue", lwd = 2)
+lines(newdata[,voi], p2[, 3], col = "green", lwd = 2)
+# some text labels help clarify things:
+text(9, 0.75, "y==1", col = "red")
+text(6, 0.4, "y==3", col = "green")
+text(5, 0.15, "y==2", col = "blue")
+```
+
+
+
+
+### Multinom + nonactionable
+
+```{r message=F, warning=F}
+
+vd <- nulli %>% 
+  select(-c(STATE_FIPS, YIELD, county, LRR, ID,ECO,
+            STATE, COUNTY_MEAN, REGION_MEAN, DIFF, BS_CAT, GEOID, YEAR)) %>%
+  select(-c(SIDI_AGMASK, BPD_AGMASK, BPD_NOMASK, IJI_AGMASK,
+            MODE_AGMASK, MODE_NOMASK, SE_NOMASK, SE_AGMASK, PERC_NATURAL_COVER, SDI_NOMASK, SDI_AGMASK, 
+            RPR_NOMASK, RPR_AGMASK, SIDI_NOMASK, RICH_AGMASK)) %>%
+  select(-c(manure_acres, insur_acres, labor_n, acres_per_op, insur_op, exp, occup, PERC_IRR)) %>%
+  select(-c(perc_cl, perc_clp, perc_o, perc_p, perc_wle, perc_pe, perc_t, cty_al, cty_clp, 
+            cons_wetlands, cons_wet_acres)) %>%
+  select(-c(herb_acres, comm_sales, crop_sales, insect_acres, income_farm, part_owner, fert_acres, income, chem)) %>%
+  select(-c( male)) %>%
+  mutate(BS_BIN = as.factor(ifelse(nulli$BS_CAT == "Bright Spot", 1, 0)),
+         DS_BIN = as.factor(ifelse(nulli$BS_CAT == "Dark Spot", 1, 0)))
+
+mlData <- vd %>% select(-c(BS_BIN, DS_BIN))
+
+# create categorical predictor
+mlData$BS_CAT <- ifelse(vd$BS_BIN == 1, "Bright", NA)
+mlData$BS_CAT <- ifelse(vd$DS_BIN == 1, "Dark", mlData$BS_CAT)
+mlData$BS_CAT[is.na(mlData$BS_CAT)] <- "Average"
+mlData$BS_CAT <- as.factor(mlData$BS_CAT)
+# set baseline 
+mlData$BS_CAT <- relevel(mlData$BS_CAT, ref = "Average")
+
+# build training and testing datasets
+set.seed(1)
+random_rn <- sample(nrow(mlData), ceiling(nrow(mlData)*.25))
+ho <- mlData[random_rn,] 
+train <- mlData[-random_rn,]
+
+table(mlData$BS_CAT)
+```
+
+```{r message=F, warning=F}
+library(nnet)
+ml_out <- multinom(BS_CAT ~ ., data = train)
+summary(ml_out)
+```
+
+```{r}
+ml_exp <- exp(coef(ml_out))
+```
+
+Adding significance:
+
+```{r}
+eff <- as.data.frame(t(ml_exp))
+eff$Variable <- rownames(eff)
+
+# add p-values, Wald test
+z <- summary(ml_out)$coefficients/summary(ml_out)$standard.errors
+# two tailed Z-test
+p <- (1-pnorm(abs(z), 0, 1)) * 2
+p <- as.data.frame(t(p))
+colnames(p) <- c("Bright_P", "Dark_P")
+p$Variable <- rownames(p)
+
+eff <- merge(eff, p, by = "Variable")
+eff$Bright_S <- as.factor(ifelse(eff$Bright_P > 0.05, "p > 0.05", "p < 0.05"))
+eff$Dark_S <- as.factor(ifelse(eff$Dark_P > 0.05, "p > 0.05", "p < 0.05"))
+```
+
+```{r}
+# plot deviations from 1 by variable rather than absolute values for comparison ?
+# order lollipops
+eff$Bright_Delta <- eff$Bright - 1
+eff$Dark_Delta <- eff$Dark - 1
+
+eff <- eff %>% 
+  filter(!Variable %in% c("(Intercept)", "CORN_SUIT")) %>% 
+  arrange(desc(Bright_Delta)) 
+
+ggplot() +
+  geom_segment(data = eff, aes(x = 0, y = Variable, xend = Bright_Delta, yend = Variable, color = Bright_S)) +
+  geom_point(data = eff, aes(x = Bright_Delta, y = Variable, color = Bright_S)) +
+  scale_color_manual(values = c("black", "red")) +
+  theme_minimal() +
+  theme(legend.title = element_blank()) +
+  xlab("Relative risk") +
+  ggtitle("Bright spots attributes") 
+```
+
+
+```{r}
+ggplot() +
+  geom_segment(data = eff, aes(x = 0, y = Variable, xend = Dark_Delta, yend = Variable, color = Dark_S)) +
+  geom_point(data = eff, aes(x = Dark_Delta, y = Variable, color = Dark_S)) +
+  scale_color_manual(values = c("black", "red")) +
+  theme_minimal() +
+  theme(legend.title = element_blank()) +
+  xlab("Relative risk") +
+  ggtitle("Dark spots attributes") 
+```
+
+Performance on held-out data and overall model fit statistics:
+
+```{r message=F, warning=F}
+prediction_scores <- predict(ml_out, ho, "probs")
+prediction_class <- predict(ml_out, ho)
+
+# confusion matrix
+table(prediction_class, ho$BS_CAT)
+# misclassification error
+mean(as.character(prediction_class) != as.character(ho$BS_CAT), na.rm=T)
+
+# pseudo R2, see this: https://www.rdocumentation.org/packages/DescTools/versions/0.99.19/topics/PseudoR2
+library(DescTools)
+PseudoR2(ml_out, which = "all")
+
+```
+
+```{r}
+
+# reproduces effects plot but more transparent
+
+prob_plot <- function(voi, xlab, n = 500) {
+  t <- rep(seq(min(train[,voi], na.rm=T), 
+             max(train[,voi], na.rm=T), length.out = n), each=3)
+  tm <- as.data.frame.list(colMeans(train %>% select(-c(BS_CAT)), na.rm = T))
+  tm <- do.call("rbind.data.frame", replicate(length(t), tm, simplify=F))
+# tm$BS_CAT <- rep(c("Dark", "Average", "Bright"), n)
+  tm[,voi] <- t
+
+  pd <- cbind.data.frame(tm, predict(ml_out, newdata = tm, type = "probs", se = T))
+
+  sub <- gather(pd, "Category", "Probability", c((ncol(pd)-2):ncol(pd)))
+  p <- ggplot(data = sub) +
+  geom_line(aes(x = sub[,voi], y = Probability, color = Category), size=1.5) +
+  xlab(xlab) +
+  theme_minimal() +
+  theme(legend.title = element_blank()) +
+  scale_color_manual(values = c("#a9a9a9", "#4C9A2A", "#000080"), name = "")   +
+  ylim(c(0,1))
+  return(p)
+
+}
+
+prob_plot(voi = "RICH_NOMASK", xlab = "SDI of agricultural lands")
+prob_plot("LPI_NOMASK", xlab = "SDI of total landscape")
+prob_plot("ED_NOMASK", xlab = "Percent natural cover")
+prob_plot("IJI_NOMASK", xlab = "Percent natural cover")
+prob_plot("irrig", xlab = "Irrigation (% operated acres)")
+prob_plot("fert", xlab = "Fertilizer ($ per operated acre)")
+prob_plot("female", xlab = "Female operators (% operated acres)")
+prob_plot("full_owner", xlab = "Full owner operator (% operated acres)")
+prob_plot("tenant", xlab = "Tenant operator (% operated acres)")
+prob_plot("ph_corn", xlab = "Acres cultivated with corn (% harvested acres)")
+prob_plot("cty_cl", xlab = "Agricultural dominance (% county covered with cropland)")
+prob_plot("machinery", xlab = "Machinery ($ per operated acre)")
+prob_plot("labor_expense", xlab = "Labor expense ($ per operation)")
+
+```
+
+
+
+
+
+
+Here's another interesting way to do the same thing, but not based on simulated data:
+
+```{r eval=F}
+# another interesting way to visualize results
+# https://thomasleeper.com/Rcourse/Tutorials/nominalglm.html
+# first create data where the VOI with simulated range of VOI
+voi <- "SDI_NOMASK"
+xlab <- "SDI_NOMASK"
+
+newdata <- mlData %>% select(-c(voi)) %>% mutate(!!voi := seq(min(mlData[,voi]), max(mlData[,voi]), length.out = nrow(mlData)))
+
+p1 <- predict(ml_out, newdata, type = "class")
+p2 <- predict(ml_out, newdata, type = "probs")
+
+plot(NA, xlim = c(min(mlData[,voi]), max(mlData[,voi])), ylim = c(0, 1), xlab = xlab, ylab = "Predicted Probability")
+lines(newdata[,voi], p2[, 1], col = "red", lwd = 2)
+lines(newdata[,voi], p2[, 2], col = "blue", lwd = 2)
+lines(newdata[,voi], p2[, 3], col = "green", lwd = 2)
+# some text labels help clarify things:
+text(9, 0.75, "y==1", col = "red")
+text(6, 0.4, "y==3", col = "green")
+text(5, 0.15, "y==2", col = "blue")
+```
+
+
+
+
+
+### Ordinal logistic regression
+
+Though we've built the categories ourselves, my sense if that "Dark", "Average", and "High" are *ordinal* rather than *nominal*.  This implies that we should use *ordinal* logistic regression rather than the *nominal* approach described above.  Nice overview of logit and orginal logistic implementation in R [here](https://www.princeton.edu/~otorres/LogitR101.pdf).  
+
+```{r message=F, warning=F}
+library(foreign)
+library(ordinal)
+
+# set up categorical predictor
+mlData <- varData
+# scale data to address SVD error related to Hess
+# scaled <- as.data.frame(scale(mlData %>% select(-c(BS_BIN, DS_BIN))))
+mlData$BS_CAT <- ifelse(varData$BS_BIN == 1, "Bright", NA)
+mlData$BS_CAT <- ifelse(varData$DS_BIN == 1, "Dark", mlData$BS_CAT)
+mlData$BS_CAT[is.na(mlData$BS_CAT)] <- "Average"
+mlData$BS_CAT <- ordered(mlData$BS_CAT, levels = c("Dark", "Average", "Bright"))
+
+# build training and testing datasets
+set.seed(1)
+random_rn <- sample(nrow(mlData), ceiling(nrow(mlData)*.25))
+ho <- mlData[random_rn,] 
+train <- mlData[-random_rn,]
+
+or_out <- clm(BS_CAT ~ ., data = train %>% select(-c(BS_BIN, DS_BIN)))
+# or_out <- polr(BS_CAT ~ ., data = train %>% select(-c(BS_BIN, DS_BIN, tenant)), na.action = na.omit, Hess=T) # Hess computes SEs
+summary(or_out)
+# or_coef <- data.frame(coef(or_out))
+# library(stargazer)
+# stargazer(or_out, type = "text")
+```
+
+Relative risk ratios are easier to interpret than the logit coefficients:
+
+```{r}
+or_rr <- exp(coef(or_out))
+```
+
+Interpretation: "Keeping all other variables constant, when X1 increases one unit it is 0.97 times more likely to be in a higher category (moving towards bright spots)."
+
+```{r}
+or_pred <- predict(or_out, ho, type = "prob")
+```
+
+### ANOVA
+
+Resource [here](https://www.r-bloggers.com/performing-anova-test-in-r-results-and-interpretation/): 
+
+Are the variations between the continents means due to true differences about the populations means or just due to sampling variability? To answer this question, ANOVA calculates a parameter called F statistics, which compares the variation among sample means (among different continents in our case) to the variation within groups (within continents).
+
+F statistics = Variation among sample means / Variation within groups
+
+Through the F statistics we can see if the variation among sample means dominates over the variation within groups, or not. In the first case we will have strong evidence against the null hypothesis (means are all equals), while in the second case we would have little evidence against the null hypothesis.
+
+```{r}
+# Make factor variable
+varData$BS_CAT <- ifelse(varData$BS_BIN == 1, "Bright", NA)
+varData$BS_CAT <- ifelse(varData$DS_BIN == 1, "Dark", varData$BS_CAT)
+varData$BS_CAT[is.na(varData$BS_CAT)] <- "Average"
+varData$BS_CAT <- as.factor(varData$BS_CAT)
+
+aov <- aov(varData$age ~ varData$BS_CAT)
+summary(aov)
+```
+
+So accept the alternative, that there is a significant relationship between bright spots and age.  Or, variation among BS/DS categories much higher than variation within each category.  ANOVA doesn't tell us which groups are different from the others.  To determine which groups are different from the others I need to conduct a POST HOC TEST or a post hoc pair comparison (note we can’t perform multiple anova tests one for each pair, as this would increase our error, see family wise error rate for more details) which is designed to evaluate pair means. There are many post hoc tests available for analysis of variance and in my case I will use the Tukey post hoc test, calling with R the function “TukeyHSD” as follows:
+
+```{r}
+tuk <- TukeyHSD(aov)
+tuk
+```
+
+Pairs categories to see where there's significant difference, in this case, between dark and average spots.  
+
+Finally, I can also visualize BS categorical pairs and analyse significant differences by plotting the the “tuk” object in R. Significant differences are the ones which not cross the zero value.
+
+```{r}
+plot(tuk)
+```
+
+** Doesn't resolve the issue of confounding factors though... **
+
+Assumptions of normal distribution and common variance (Levene's test can check this out).  Numeric points are outliers that can affect normality and homogeneity of variance.  
+
+```{r}
+plot(aov, 1)
+```
+
+We can also test for equal variance statistically:
+
+```{r message=F, warning=F}
+library(car)
+leveneTest(age ~ BS_CAT, data = varData)
+```
+
+From the output above we can see that the p-value is not less than the significance level of 0.05. This means that there is no evidence to suggest that the variance across groups is statistically significantly different. Therefore, we can assume the homogeneity of variances in the different treatment groups.
+
+If we want to assume unequal variance, do ANOVA this way:
+
+```{r}
+# ANOVA with no assumption of equal variance
+oneway.test(age ~ BS_CAT, data=varData)
+```
+
+And check the normality assumption:
+
+```{r}
+plot(aov, 2)
+# Run Shapiro-Wilk test
+# shapiro.test(x = aov_residuals )
+```
+
+Ok, so if we want to do this systematically for all predictors, we'd want to:
+
+1.  Check variance assumption
+2.  Check normality assumption
+3.  Assuming these are cool, perform ANOVA
+4.  And to get at nuance, do the Tukey test to see whic categories are different
+5.  Probably also plot a box and whisker with ANOVA results at the bottom plus Tukey for clarity.
+
+Function to do all of this for a variable is below:
+
+```{r message=F, warning=F}
+library(Hmisc)
+# takes scaled with BS_CAT as input
+
+anova_res <- function(voi) {
+  out <- list()
+  aov <- aov(varData[,voi] ~ varData$BS_CAT)
+  out[["aov"]] <- summary(aov)
+  out[["aov_p"]] <- summary(aov)[[1]][["Pr(>F)"]][1]
+  out[["var"]] <- leveneTest(age ~ BS_CAT, data = varData)
+  p <- plot(aov, 2)
+  out[["normal"]] <- p
+  out[["tuk"]] <- TukeyHSD(aov)
+  
+  plt <- ggplot(data = varData) +
+    geom_boxplot(aes(x = varData[,"BS_CAT"], y = varData[,voi])) +
+    xlab(paste0("ANOVA p:", round(out[["aov_p"]], 2), "      Variance p:", round(out[["var"]]$`Pr(>F)`[1], 2))) +
+    ylab(capitalize(voi)) +
+    theme_minimal() 
+  out[["plot"]] <- plt
+  return(out)
+}
+
+irr <- anova_res(voi = "irrig")
+irr$plot
+irr$tuk
+```
+
+### ETC
+
+####  Discriminant analysis (th=1.5)
+
+Resources and notes:
+* https://rstudio-pubs-static.s3.amazonaws.com/35817_2552e05f1d4e4db8ba87b334101a43da.html
+* Model the distribution of the predictors X in each response class Y.  Say Y can take on K classifications (3 in our case)
+* https://www.datascienceblog.net/post/machine-learning/linear-discriminant-analysis/
+* Check to make sure data Gaussian.  Consider reviewing the univariate distributions of each attribute and using transforms to make them more Gaussian-looking (e.g. log and root for exponential distributions and Box-Cox for skewed distributions).
+* Consider removing outliers.  Standardize data with mean 0 and SD of 1 so that each input variable has the same variance.
+
+Look into:
+* Flexible Discriminant Analysis (FDA): Where non-linear combinations of inputs is used such as splines.
+* Regularized Discriminant Analysis (RDA): Introduces regularization into the estimate of the variance (actually covariance), moderating the influence of different variables on LDA.
+
+When true decision boundaries are linear, LDA and logistic are fine.  When boundaries are moderately non-linear, QDA will perform better.
+
+##### LDA
+
+PCA finds component axes that maximumze the variance, LDA maximizes the component axes for class separation ([here](https://towardsdatascience.com/linear-discriminant-analysis-lda-101-using-r-6a97217a55a6))
+
+```{r message=F, warning=F, eval=F}
+library(MASS)
+lda.fit = lda(BS_BIN ~ age + female + tenant + chem + machinery + irrig + labor_expense +
+            gvt_prog + ph_corn + cty_cl + SDI_NOMASK + PERC_NATURAL_COVER + RICH_NOMASK, data = train)  # subset = train
+lda.fit
+```
+
+Group means are averages of each predictor in each class.  Coefficients are the linear combinations of predictors used to make the LDA decision rule.  
+
+```{r eval=F}
+lda.pred <- predict(lda.fit, ho)
+table(lda.pred$class, ho$BS_BIN)
+mean(lda.pred$class == ho$BS_BIN)
+```
+
+```{r eval=F}
+library(ROCR)
+# roc plot
+pred <- prediction(lda.pred$posterior[,2], ho$BS_BIN)
+roc <- performance(pred, measure = "tpr", x.measure = "fpr")
+auc.train <- performance(pred, measure = "auc")
+auc.train <- auc.train@y.values
+# Plot
+plot(roc)
+abline(a=0, b= 1)
+text(x = .25, y = .65 ,paste("AUC = ", round(auc.train[[1]],3), sep = ""))
+```
+
+##### QDA
+
+Assumes that each class has its own covariance matrix.  This is a better option for large datasets, as it tends to have lower bias and a higher variance (see [here](https://towardsdatascience.com/classification-part-2-linear-discriminant-analysis-ea60c45b9ee5)).
+
+Estimates a separate covariance matrix for each class.  This can lead to a lot of parameters to estimate.  
+
+```{r eval=F}
+qda.fit = qda(BS_BIN ~ age + female + tenant + chem + machinery + irrig + labor_expense +
+            gvt_prog + ph_corn + cty_cl + SDI_NOMASK + PERC_NATURAL_COVER + RICH_NOMASK, data = train)  # subset = train
+qda.fit
+```
+
+```{r eval=F}
+qda.class = predict(qda.fit, ho)
+table(qda.class$class, ho$BS_BIN)
+mean(qda.class$class == ho$BS_BIN)
+```
+
+#### LASSO regression
+
+* Resource referenced throughout found [here](https://eight2late.wordpress.com/2017/07/11/a-gentle-introduction-to-logistic-regression-and-lasso-regularisation-using-r/)
+
+```{r eval=F}
+set.seed(1)
+random_rn <- sample(nrow(varData), ceiling(nrow(varData)*.25))
+ho <- varData[random_rn,] 
+train <- varData[-random_rn,]
+
+library(glmnet)
+s <- train %>% select(-c(DS_BIN))
+x <- model.matrix(s$BS_BIN ~ ., s)
+y <- ifelse(s$BS_BIN == "1", 1, 0)
+cv.out <- cv.glmnet(x,y,alpha=1, family="binomial", type.measure = "mse") # automatically performs grid search to find best value lambda
+plot(cv.out)
+```
+
+The plot shows that the log of the optimal value of lambda (i.e. the one that minimises the root mean square error) is approximately -5. The exact value can be viewed by examining the variable lambda_min in the code below. In general though, the objective of regularisation is to balance accuracy and simplicity. In the present context, this means a model with the smallest number of coefficients that also gives a good accuracy.  To this end, the cv.glmnet function  finds the value of lambda that gives the simplest model but also lies within one standard error of the optimal value of lambda. This value of lambda (lambda.1se) is what we’ll use in the rest of the computation. Interested readers should have a look at this article for more on lambda.1se vs lambda.min.
+
+```{r eval=F}
+#min value of lambda
+lambda_min <- cv.out$lambda.min
+#best value of lambda
+lambda_1se <- cv.out$lambda.1se
+#regression coefficients with lse
+coef(cv.out,s=lambda_1se)
+#regression coefficients with lambda.min
+```
+
+The output shows that only those variables that we had determined to be significant on the basis of p-values have non-zero coefficients. The coefficients of all other variables have been set to zero by the algorithm! Lasso has reduced the complexity of the fitting function massively…and you are no doubt wondering what effect this  has on accuracy. Let’s see by running the model against our test data:
+
+```{r eval=F}
+#get test data
+x_test <- model.matrix(BS_BIN ~ ., ho %>% select(-c(DS_BIN)))
+#predict class, type=”class”
+lasso_prob <- predict(cv.out, newx = x_test, s=lambda_1se, type = "response")
+
+#translate probabilities to predictions
+lasso_predict <- rep(0,nrow(ho))
+lasso_predict[lasso_prob>.5] <- 1
+
+#confusion matrix
+table(pred=lasso_predict,true=ho$BS_BIN)
+#accuracy
+mean(lasso_predict==ho$BS_BIN)
+```
+
+Final model with lambda threshold:
+
+```{r eval=F}
+# Final model with lambda.min and with lambda.lse, compare fit, as well as with logistic regression
+lasso.model <- glmnet(x, y, alpha = 1, family = "binomial",
+                      lambda = lambda_min)
+# Make prediction on test data
+x.test <- model.matrix(BS_BIN ~., ho %>% select(-c("DS_BIN")))
+probabilities <- lasso.model %>% predict(newx = x.test)
+predicted.classes <- ifelse(probabilities > 0.5, 1, 0)
+# Model accuracy
+observed.classes <- ho$BS_BIN
+mean(predicted.classes == observed.classes)
+```
+
+```{r eval=F}
+# Final model with lambda.min and with lambda.lse, compare fit, as well as with logistic regression
+lasso.model <- glmnet(x, y, alpha = 1, family = "binomial",
+                      lambda = lambda_1se)
+# Make prediction on test data
+x.test <- model.matrix(BS_BIN ~., ho %>% select(-c("DS_BIN")))
+probabilities <- lasso.model %>% predict(newx = x.test)
+predicted.classes <- ifelse(probabilities > 0.5, 1, 0)
+# Model accuracy
+observed.classes <- ho$BS_BIN
+mean(predicted.classes == observed.classes)
+```
+
+Compare to fit of logistic regression... think through subset selection.
+
+
